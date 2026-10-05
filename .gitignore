@@ -9,3 +9,7 @@ ksu/tools/kmsg_dumper
 ksu/.build*/
 build/
 ksu/tools/kernelsu.ko
+
+# ---- local extraction artifacts (boot images / kernel Image / kallsyms) ----
+tools/bootimg/
+*.img

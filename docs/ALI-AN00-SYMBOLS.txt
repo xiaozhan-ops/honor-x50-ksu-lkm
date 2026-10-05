@@ -1,0 +1,96 @@
+# ALI-AN00 / ALI-TN00 kernel symbols extracted from device boot images
+
+Two boot dumps were supplied in `E:/Projects/honor-x50/`:
+
+| | `boot.img` | `boot (2).img` |
+| :--- | :--- | :--- |
+| Reported | ALI-AN00 9.0.0.220 (CNC00E206R9P4) | ALI-TN00 9.0.0.230 |
+| Kernel (measured) | `5.10.236-android12-9-gf68ed03ce0d2` | `5.10.236-android12-9-g4b262e5255ed` |
+| Size | 100663296 B | 100663296 B |
+| Kernel Image | offset 4096, 51771404 B | offset 4096, 51771404 B |
+| Image sha256 | `4572c99273d1438a…` | `8345f871120cf41e…` |
+| Symbols | 140,046 | 140,046 |
+
+Extraction: `ANDROID!` header v0, header occupies one 4096-byte page,
+`kernel_size` at header offset 8. Arm64 magic `ARM\x64` sits at Image `+0x38`
+and `+0x08` holds `text_offset=0`.
+
+Caution: `Image[0:2]` reads as `MZ`, which looks like a PE header and is not
+one. It is coincidental bytes.
+
+Tool: `kallsyms.c` (from IonStack's `target_generator`, GPL), `gcc -O2`.
+The full tables are ~6.1 MB each and are not committed; only the symbols the
+exploit depends on are listed below. `cmp_boots.py` regenerates the comparison.
+
+## Identical on both boots
+
+```
+ffffffc00a81bf80 D init_task            -> 0x281bf80
+ffffffc00a830c18 D init_cred            -> 0x2830c18
+ffffffc00ad54080 B root_task_group      -> 0x2d54080
+ffffffc00ae84b38 B selinux_state        -> 0x2e84b38
+ffffffc00abbfd80 d sig_enforce          -> 0x2bbfd80
+ffffffc00ae8889c B g_rscan_skip_flag    -> 0x2e8889c
+ffffffc00a811430 d nfulnl_logger        -> 0x2811430
+ffffffc00a811358 d loggers              -> 0x2811358
+ffffffc00ae9cedd b sysctl_bootid        -> 0x2e9cedd
+ffffffc00ac4a5c0 D random_table         -> 0x2c4a5c0
+ffffffc008355258 T commit_creds         -> 0x355258
+```
+
+`KIMAGE_TEXT_BASE = 0xffffffc008000000` on both.
+
+## Differ: sched_class group, TN is +0x200
+
+```
+              AN (9.0.0.220)     TN (9.0.0.230)
+idle_sched_class  0x2344920        0x2344b20
+fair_sched_class  0x2344a00        0x2344c00
+rt_sched_class    0x2344ae0        0x2344ce0
+dl_sched_class    0x2344bc0        0x2344dc0
+stop_sched_class  0x2344ca0        0x2344ea0
+```
+
+The TN values match the 80 GT `annap-AGT-AN00_9.0.0.230` profile's documented
+quartet (idle=0x2344b20 fair=0x2344c00 rt=0x2344ce0 dl=0x2344dc0) exactly,
+which is how TN gets identified as 9.0.0.230-family.
+
+`SLIDE_RT_SCHED_CLASS_OFF` therefore differs per profile:
+`0x23447e0` for TN (copied from 80 GT 9.0.0.230), `0x23445e0` for AN
+(derived: `0x2344ae0 - 0x500`). The `0x500` delta is the distance from the
+`rt_sched_class` symbol to the member actually stamped into
+`fake_task->sched_class` — see docs/ALI-AN00-TN-COMPARISON.md.
+
+## Not symbols — cannot be checked against kallsyms
+
+```
+sysctl_bootid + 3            0x2e9cee0   derived (16-byte buffer at 0x2e9cedd;
+                                         +3 keeps an 8-byte store aligned)
+boot_id ctl_table entry      0x2c4a6c0   random_table + 0x100
+                                         (table base verified; +0x100 inherited)
+```
+
+## Kernel config (identical on both)
+
+```
+CONFIG_CFI_CLANG=y
+CONFIG_CFI_CLANG_SHADOW=y
+# CONFIG_CFI_PERMISSIVE is not set
+CONFIG_MODULE_SIG=y
+CONFIG_MODULE_SIG_FORCE=y
+CONFIG_MODULE_SIG_ALL=y
+CONFIG_ASHMEM=y
+CONFIG_FUTEX=y
+CONFIG_FUTEX_PI=y
+CONFIG_DEBUG_RT_MUTEXES  (absent -> off)
+```
+
+`CONFIG_FUTEX_PI=y` is the only requirement for CVE-2026-43499 — so the device
+is in scope. `CONFIG_MODULE_SIG_FORCE=y` is why the chain must flip
+`sig_enforce` to 0 before `init_module`.
+
+## Full-diff context
+
+140,046 shared symbols, 22,554 with differing addresses, 0 unique to either
+side. The symbol set is identical; only addresses move. Most differences are
+compiler statics (`.compoundliteral.*`) shifting within `.rodata`/`.data`.

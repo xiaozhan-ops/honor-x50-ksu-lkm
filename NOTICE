@@ -1,0 +1,88 @@
+ALI-AN00-cve-2026-43499
+Copyright 2026 a23bc and contributors
+
+This repository is a fork of yakidango-official/GhostLock-H80GT. The exploit
+core is unmodified from that project; what this fork adds is target profiles
+measured from the Honor X50's own boot images, plus the verification tooling and
+documentation behind them.
+
+Upstream chain of custody
+--------------------------------------------------------------------------------
+- yakidango-official/GhostLock-H80GT — the fork point
+  https://github.com/yakidango-official/GhostLock-H80GT
+  Apache-2.0
+
+  Which in turn derives from:
+  - NebuSec/CyberMeowfia — IonStack / CVE-2026-43499 (Apache-2.0)
+    https://github.com/NebuSec/CyberMeowfia
+  - BuSung-dev/CVE-2026-43499-S25U (Apache-2.0)
+    https://github.com/BuSung-dev/CVE-2026-43499-S25U
+  - F-19-F/IonStackQuest3
+    https://github.com/F-19-F/IonStackQuest3
+
+The Apache License 2.0 is retained verbatim in LICENSE. Per section 4(d) of that
+license, this NOTICE states what was changed.
+
+What this fork changed
+--------------------------------------------------------------------------------
+ADDED  exploit/src/targets/annap-ALI-AN00_9.0.0.220/target.h
+       Honor X50 (ALI-AN00), MagicOS 9.0.0.220, kernel
+       5.10.236-android12-9-gf68ed03ce0d2. Kernel-symbol offsets measured from
+       the device's own boot image, not copied from another model.
+
+ADDED  exploit/src/targets/annap-ALI-TN00_9.0.0.230/target.h
+       Honor X50 (ALI-TN00), MagicOS 9.0.0.230, kernel
+       5.10.236-android12-9-g4b262e5255ed. Same method.
+
+       Both profiles inherit struct-layout offsets (FAKE_TASK_*, WAITER_*,
+       TASK_CRED_OFF, MM_OWNER_OFF, and the random_table + 0x100 boot_id entry)
+       from the upstream 80 GT profile. Those are NOT verified on either X50
+       device; each is flagged inline in the target.h files.
+
+ADDED  docs/ALI-AN00-TN-COMPARISON.md    two-boot symbol diff, build verification
+ADDED  docs/ALI-AN00-VERIFICATION.md     offset provenance and what stays unproven
+ADDED  docs/ALI-AN00-SYMBOLS.txt         measured symbol table and kernel config
+ADDED  docs/cmp_boots.py                 reproducible two-boot symbol comparison
+ADDED  docs/verify_offsets.py            reproducible profile-offset check
+
+CHANGED  exploit/Makefile
+       Default PROJECT switched from the 80 GT profile to the X50 one. The NDK
+       host tag is now detected instead of hardcoded to prebuilt/linux-x86_64,
+       which on a Windows host pointed --sysroot at a nonexistent path and made
+       every libc include fail. RESOURCE_DIR is globbed rather than pinned to
+       lib/clang/21, which does not exist in NDK r29.
+
+CHANGED  README.md, ksu/README.md
+       Rewritten to cover only the Honor X50. The upstream per-device tables and
+       per-model build instructions were removed. Now English-only.
+
+REMOVED  README.zh-CN.md, ksu/README.zh-CN.md
+       The repository is English-only; the English READMEs are the sole entry
+       points.
+
+CHANGED  release/setup.sh
+       Three runtime prompts translated from Chinese to English.
+
+CHANGED  docs/cmp_boots.py, docs/verify_offsets.py, ksu/build_inner.sh
+       Comments and output rewritten in English; no functional change to the
+       scripts.
+
+NOT CHANGED  exploit/src/*.c, exploit/src/*.h — the exploit core.
+
+Not hardware-tested. Firmware version strings could not be verified from inside
+the boot images: neither dump contains build.prop, MagicOS, or ALI-* strings.
+
+--------------------------------------------------------------------------------
+CVE-2026-43499 ("GhostLock")
+--------------------------------------------------------------------------------
+A use-after-free in remove_waiter(), kernel/locking/rtmutex.c, on the futex
+requeue-PI proxy-lock rollback path. Upstream fix commit 3bfdc63936dd ("rtmutex:
+Use waiter::task instead of current in remove_waiter()"), landed in Linux 7.1.
+Reported by VEGA at Nebula Security.
+
+--------------------------------------------------------------------------------
+Third-party components redistributed in this repository
+--------------------------------------------------------------------------------
+ksu/tools/ksud, ksu/tools/magiskpolicy — prebuilt binaries from the KernelSU and
+Magisk projects. KernelSU is GPL-2.0 (see ksu/LICENSE); Magisk is GPL-2.0.
+They are redistributed unmodified.
