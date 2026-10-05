@@ -1,4 +1,3 @@
-English | [中文](README.zh-CN.md)
 
 # Custom KernelSU.ko for Honor 80 GT
 

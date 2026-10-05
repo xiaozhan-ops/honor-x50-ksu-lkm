@@ -51,7 +51,8 @@ make $TOOLS security/selinux/ -j"$(nproc)" || true
 # system would orphan every running domain's SID) and do NOT re-enable
 # enforcing (the flow enforces manually as the last step). App profiles stay
 # ENABLED (default KSU behavior) — CONFIG_KSU_DISABLE_POLICY=y would make
-# GET/SET_APP_PROFILE return -EOPNOTSUPP ("更新 App Profile 失败" in manager).
+# GET/SET_APP_PROFILE return -EOPNOTSUPP, which the manager surfaces as
+# "failed to update App Profile".
 make -C /kernel M=/ksu/kernel $TOOLS CONFIG_KSU=m KCFLAGS=-Wno-error modules -j"$(nproc)"
 
 ls -la /ksu/kernel/kernelsu.ko
