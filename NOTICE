@@ -69,8 +69,8 @@ CHANGED  docs/cmp_boots.py, docs/verify_offsets.py, ksu/build_inner.sh
 
 NOT CHANGED  exploit/src/*.c, exploit/src/*.h — the exploit core.
 
-Not hardware-tested. Firmware version strings could not be verified from inside
-the boot images: neither dump contains build.prop, MagicOS, or ALI-* strings.
+Hardware-tested on ALI-AN00, MagicOS 9.0.0.220 (see README). Firmware version
+strings could not be verified from inside the boot images: neither dump contains build.prop, MagicOS, or ALI-* strings.
 
 CHANGED  exploit/src/sysctl.c
        Added a SYSCTL_VERIFY_ONLY pre-flight gate before the cred write. When

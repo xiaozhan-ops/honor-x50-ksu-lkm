@@ -1,6 +1,8 @@
 
 # Honor X50 (ALI-AN00): KernelSU LKM port on a locked bootloader
 
+**English** | [简体中文](README.zh-CN.md)
+
 A working **KernelSU kernel-module (LKM) port** for the Honor X50
 (ALI-AN00 / ALI-TN00), together with the privilege escalation required to load
 it on a device whose bootloader cannot be unlocked.
@@ -132,7 +134,11 @@ write landed; re-run.
   (`rt_sched_class - 0x500`), not measured. The `0x500` relationship is
   confirmed on the other profile; re-derive this one first if a run panics in
   `check_class_changed()`.
-- **No run on real hardware yet.**
+- **Individual offsets.** The chain has been run repeatedly on an ALI-AN00 /
+  MagicOS 9.0.0.220 device: it reaches the cred write, `getuid()` returns 0,
+  `kernelsu.ko` loads and the Manager reports it running. That exercises every
+  offset end to end, but does not pin each one down individually — only
+  `mm->owner` and `task->comm` are checked explicitly by the VERIFY stage.
 
 ## Documentation
 
