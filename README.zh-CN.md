@@ -38,6 +38,10 @@ root 依然是**一次性的（每次开机重来）**：cred 替换和内核模
 | `annap-ALI-AN00_9.0.0.220` | 荣耀 X50（ALI-AN00） | MagicOS 9.0.0.220，build CNC00E206R9P4 | `5.10.236-android12-9-gf68ed03ce0d2` |
 | `annap-ALI-TN00_9.0.0.230` | 荣耀 X50（ALI-TN00） | MagicOS 9.0.0.230 | `5.10.236-android12-9-g4b262e5255ed` |
 
+`exploit/src/targets/` 里还带着 fork 随附的 `annap-AGT-AN00_*`（荣耀 80 GT）profile。
+那些在本项目里不维护，本项目也不对其作任何声明；`ksu/` 与 `release/` 同样是 80 GT 的工具，
+只为留存来源而保留（见各自的说明）。
+
 偏移是用 `kallsyms.c` 从各自 boot dump 里切出来的 kernel Image 上提取的（各 140,046 个符号）。
 
 **请选与设备实际固件匹配的 profile。** 两者的差异正好在最要紧的地方：exploit 读取的 16 个

@@ -47,6 +47,11 @@ of boot.
 | `annap-ALI-AN00_9.0.0.220` | Honor X50 (ALI-AN00) | MagicOS 9.0.0.220, build CNC00E206R9P4 | `5.10.236-android12-9-gf68ed03ce0d2` |
 | `annap-ALI-TN00_9.0.0.230` | Honor X50 (ALI-TN00) | MagicOS 9.0.0.230 | `5.10.236-android12-9-g4b262e5255ed` |
 
+`exploit/src/targets/` also carries the upstream `annap-AGT-AN00_*` profiles for
+the Honor 80 GT, inherited with the fork. They are not maintained here and this
+project makes no claim about them; `ksu/` and `release/` are likewise 80 GT
+tooling, kept for provenance (see their scope notes).
+
 Offsets were extracted with `kallsyms.c` from the kernel Image sliced out of
 each boot dump (140,046 symbols each).
 
