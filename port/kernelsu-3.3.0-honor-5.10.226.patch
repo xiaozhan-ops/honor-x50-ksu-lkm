@@ -1,0 +1,2114 @@
+diff -ruN --strip-trailing-cr a/kernel/Kbuild b/kernel/Kbuild
+--- a/kernel/Kbuild	2026-11-12 10:30:25.723779800 +0800
++++ b/kernel/Kbuild	2026-11-12 10:30:25.942651700 +0800
+@@ -22,6 +22,7 @@
+ kernelsu-objs += infra/seccomp_cache.o
+ kernelsu-objs += infra/su_mount_ns.o
+ kernelsu-objs += infra/symbol_resolver.o
++kernelsu-objs += infra/ext_fns.o
+ 
+ ifneq ($(CONFIG_KSU_DISABLE_MANAGER),y)
+ kernelsu-objs += manager/apk_sign.o
+@@ -120,7 +121,7 @@
+ else
+ # If there is no .git directory, use default version
+ $(warning "KSU_GIT_VERSION not defined! It is better to make KernelSU a git repository!")
+-ccflags-y += -DKSU_VERSION=16
++ccflags-y += -DKSU_VERSION=33001
+ endif
+ 
+ KSU_NEW_DCACHE_FLUSH := $(shell grep -q __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h ; echo $$?)
+diff -ruN --strip-trailing-cr a/kernel/core/init.c b/kernel/core/init.c
+--- a/kernel/core/init.c	2026-11-12 10:30:25.726284300 +0800
++++ b/kernel/core/init.c	2026-11-12 10:30:25.869777800 +0800
+@@ -2,6 +2,7 @@
+ #include <linux/fs.h>
+ #include <linux/kobject.h>
+ #include <linux/module.h>
++#include <linux/delay.h>
+ #include <linux/rcupdate.h>
+ #include <linux/sched.h>
+ #include <linux/workqueue.h>
+@@ -20,12 +21,14 @@
+ #include "feature/sulog.h"
+ #include "supercall/supercall.h"
+ #include "ksu.h"
++#include "ext_fns.h"
+ #include "infra/file_wrapper.h"
+ #include "selinux/selinux.h"
+ #include "hook/syscall_hook.h"
+ #include "feature/adb_root.h"
+ #include "feature/selinux_hide.h"
+ #include "infra/symbol_resolver.h"
++#include "manager/manager_identity.h"
+ 
+ #if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
+ #include <asm/cpufeature.h>
+@@ -45,6 +48,7 @@
+     (defined(CONFIG_ARM64) && defined(MODULE) && !defined(CONFIG_STACKPROTECTOR_PER_TASK))
+ #include <linux/stackprotector.h>
+ #include <linux/random.h>
++#include "manager/manager_identity.h"
+ unsigned long __stack_chk_guard __ro_after_init __attribute__((visibility("hidden")));
+ 
+ __attribute__((no_stack_protector)) void __init ksu_setup_stack_chk_guard()
+@@ -73,6 +77,8 @@
+ struct cred *ksu_cred;
+ bool ksu_late_loaded;
+ 
++int ksu_install_backup_sepolicy(const char *path);
++
+ #ifdef CONFIG_KSU_DEBUG
+ bool allow_shell = true;
+ #else
+@@ -80,11 +86,104 @@
+ #endif
+ module_param(allow_shell, bool, 0);
+ 
++// the GhostLock sysctl route hijacks boot_id's ctl_table.data as its
++// arbitrary R/W channel and never restores it to buffer+0, so after the
++// chain /proc/sys/kernel/random/boot_id reads VOLATILE kernel memory.
++// libcutils builds /dev/ashmem<boot_id> at every app start -> ENOENT ->
++// fallback /dev/ashmem is denied for app domains -> every app crashes, and a
++// userspace mknod workaround cannot work (the value keeps changing). Kernel-space
++// fix: point ctl_table.data back at the true sysctl_bootid buffer (ueventd
++// already created /dev/ashmem<true-uuid> at boot). Both are statics stripped
++// from kallsyms, so the loader passes link+slide as module params.
++static unsigned long bootid_ctl;
++/* module_param needs param_ops_ulong as a link-time constant, which this kernel
++ * does not export; the values stay 0 and the auto-restore is skipped. */
++static unsigned long bootid_buf;
++
++// path to a pristine /sys/fs/selinux/policy snapshot captured before
++// any root rule injection; loaded at init as the selinux_hide backup.
++static char *pristine_policy;
++module_param(pristine_policy, charp, 0);
++
++static void __init restore_bootid(void)
++{
++    if (!bootid_ctl || !bootid_buf)
++        return;
++    // struct ctl_table: procname @ +0, data @ +8 (device-verified layout)
++    *(void **)(bootid_ctl + 8) = (void *)bootid_buf;
++    pr_info("boot_id ctl.data restored (ctl=0x%lx buf=0x%lx)\n",
++            bootid_ctl, bootid_buf);
++}
++
+ bool ksu_no_custom_rc = false;
+ module_param_named(norc, ksu_no_custom_rc, bool, 0);
+ 
++
++static void ksu_throne_scan_workfn(struct work_struct *work)
++{
++    track_throne(false);
++    pr_info("KSUBC: deferred throne scan finished, manager appid=%d\n",
++            (int)ksu_get_manager_appid());
++}
++static DECLARE_DELAYED_WORK(ksu_throne_work, ksu_throne_scan_workfn);
++
+ int __init kernelsu_init(void)
+ {
++    /* Resolve every runtime shim BEFORE anything that can call one:
++     * prepare_creds() below is a trampoline through ksu_ext_p_prepare_creds,
++     * which is still NULL until ksu_ext_syms_init() has run. Jumping through a
++     * NULL slot is an instant branch-to-zero. */
++    pr_info("KSUBC: enter\n");
++    ksu_ext_syms_init();
++    pr_info("KSUBC: shims ok\n");
++    ksu_init_symbol_resolver();
++    pr_info("KSUBC: resolver ok\n");
++    ksu_syscall_hook_init();
++    pr_info("KSUBC: syscall hook staged (userspace patch pending)\n");
++    ksu_feature_init();
++    ksu_sulog_init();
++    /* Two stages are skipped on purpose:
++     *  - ksu_adb_root_init() hard-resets (bisected); adb-level root is unused.
++     *  - ksu_lsm_hook_init() hard-resets (bisected) and only matters for
++     *    SELinux context transitions; the exploit already leaves the device
++     *    permissive, so supercalls do not need it. */
++    ksu_supercalls_init();
++
++    /* The allowlist backs per-app authorisation. Only setup_ksu_cred() (the
++     * SELinux domain transition) hard-resets this kernel, so bring the
++     * allowlist up without it. */
++    ksu_allowlist_init();
++    pr_info("KSUBC: allowlist init ok\n");
++    ksu_load_allow_list();
++    pr_info("KSUBC: allowlist loaded\n");
++
++    /* setup_ksu_cred() would do a SELinux domain transition into
++     * KERNEL_SU_CONTEXT, which needs the SELinux internals this port cannot
++     * drive (it hard-resets). The exploit already runs as uid 0 in
++     * u:r:kernel:s0, so the plain cred is a perfectly good root cred here. */
++    ksu_cred = prepare_creds();
++    pr_info("KSUBC: ksu_cred=%d (no domain transition)\n", ksu_cred != NULL);
++
++    /* Registers the execve/setresuid hooks (su_compat lives in here), which is
++     * what actually turns an app su exec into a root process. */
++    ksu_syscall_hook_manager_init();
++    pr_info("KSUBC: syscall hook manager ok\n");
++
++    /* Detects the Manager package and records its appid; the setresuid hook
++     * uses that appid to whitelist `reboot` in seccomp and to install the ksu
++     * fd into the Manager process. */
++    /* track_throne() walks /data/system/packages.list and /data/app in module
++     * init and hard-resets this kernel, so the Manager appid is pinned
++     * directly instead. 10051 is me.weishu.kernelsu on this device. */
++    /* track_throne() walks /data/system/packages.list and /data/app; running it
++     * directly inside module init hard-resets the device, so defer it to a
++     * workqueue where it runs in plain process context. */
++    schedule_delayed_work(&ksu_throne_work, 5 * HZ);
++    pr_info("KSUBC: throne scan scheduled in 5s\n");
++
++    pr_info("KSUBC: init complete (shims+resolver+hook-staged+feature+sulog+supercalls+allowlist)\n");
++    return 0;
++
+ #if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
+     // If the kernel has the hardening patch, X86_FEATURE_INDIRECT_SAFE must be set
+     if (!boot_cpu_has(X86_FEATURE_INDIRECT_SAFE)) {
+@@ -126,22 +225,69 @@
+         return -ENOSYS;
+     }
+ 
++    pr_info("KSUBC: init ENTER\n");
+     ksu_init_symbol_resolver();
++    pr_info("KSUBC: symbol_resolver done\n");
++    ksu_ext_syms_init();
++    pr_info("KSUBC: ext_syms done\n");
+     ksu_syscall_hook_init();
++    pr_info("KSUBC: syscall_hook done\n");
+ 
++    pr_info("KSUBC: stage feature BEGIN\n");
++    msleep(2000);
+     ksu_feature_init();
++    pr_info("KSUBC: stage feature DONE\n");
++    msleep(2000);
++
++    pr_info("KSUBC: stage sulog/adb_root BEGIN\n");
++    msleep(2000);
+     ksu_sulog_init();
+     ksu_adb_root_init();
++    pr_info("KSUBC: stage sulog/adb_root DONE\n");
++    msleep(2000);
++
++    pr_info("KSUBC: stage lsm_hook BEGIN\n");
++    msleep(2000);
+     ksu_lsm_hook_init();
++    pr_info("KSUBC: stage lsm_hook DONE\n");
++    msleep(2000);
++
++    pr_info("KSUBC: stage selinux_hide BEGIN\n");
++    msleep(2000);
+     ksu_selinux_hide_init();
++    pr_info("KSUBC: stage selinux_hide DONE\n");
++    msleep(2000);
+ 
++    pr_info("KSUBC: stage supercalls BEGIN\n");
++    msleep(2000);
+     ksu_supercalls_init();
++    pr_info("KSUBC: stage supercalls DONE\n");
++    msleep(2000);
++
++    pr_info("KSUBC: stage app_profile BEGIN\n");
++    msleep(2000);
+     ksu_app_profile_init();
++    pr_info("KSUBC: stage app_profile DONE\n");
++    msleep(2000);
+ 
+     if (ksu_late_loaded) {
+         pr_info("late load mode, skipping kprobe hooks\n");
+ 
+-        apply_kernelsu_rules();
++        // NEVER call apply_kernelsu_rules() on a late load: the same rules
++        // are already injected BEFORE this module loads via magiskpolicy
++        // --live (device-verified clean), so a second application here is
++        // redundant. (An earlier revision of this comment blamed the
++        // dup/swap-and-destroy itself for a device-verified servicemanager
++        // breakage; that breakage was later root-caused to the exploit's
++        // own permissive write clearing selinux_state.initialized@+2, and
++        // the swap path is exonerated.)
++        pr_info("not touching live sepolicy (rules pre-injected)\n");
++        if (pristine_policy) {
++            // best effort: selinux_hide stays -EAGAIN without it, never fatal
++            if (ksu_install_backup_sepolicy(pristine_policy))
++                pr_err("selinux_hide backup unavailable\n");
++        }
++        restore_bootid();
+         cache_sid();
+         setup_ksu_cred();
+ 
+@@ -162,9 +308,10 @@
+         ksu_boot_completed = true;
+         track_throne(false);
+ 
++        // do NOT setenforce(true) here. Enforcing is flipped manually
++        // as the LAST step of the load flow, after userspace is set up.
+         if (!getenforce()) {
+-            pr_info("Permissive SELinux, enforcing\n");
+-            setenforce(true);
++            pr_info("keeping permissive until flow enforces manually\n");
+         }
+ 
+     } else {
+diff -ruN --strip-trailing-cr a/kernel/feature/kernel_umount.c b/kernel/feature/kernel_umount.c
+--- a/kernel/feature/kernel_umount.c	2026-11-12 10:30:25.728163600 +0800
++++ b/kernel/feature/kernel_umount.c	2026-11-12 10:30:25.876034000 +0800
+@@ -65,6 +65,7 @@
+ };
+ 
+ extern int path_umount(struct path *path, int flags);
++#include "ext_fns.h"
+ 
+ static void ksu_umount_mnt(const char *mnt, struct path *path, int flags)
+ {
+diff -ruN --strip-trailing-cr a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+--- a/kernel/feature/selinux_hide.c	2026-11-12 10:30:25.736479800 +0800
++++ b/kernel/feature/selinux_hide.c	2026-11-12 10:30:25.872316200 +0800
+@@ -75,6 +75,7 @@
+                                             struct extended_perms *xperms) = NULL;
+ #else
+ static struct selinux_state fake_state;
++#include "ext_fns.h"
+ #endif
+ 
+ static write_op_fn *context_write, *access_write;
+diff -ruN --strip-trailing-cr a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
+--- a/kernel/feature/sucompat.c	2026-11-12 10:30:25.736979300 +0800
++++ b/kernel/feature/sucompat.c	2026-11-12 10:30:25.876915400 +0800
+@@ -26,8 +26,11 @@
+ #include "sulog/event.h"
+ #include "ksu.h"
+ #include "util.h"
++#include "ext_fns.h"
+ 
+-#define SU_PATH "/system/bin/su"
++/* This port has no overlay-provided /system/bin/su, so su_compat watches the
++ * ksud symlink we ship in /data/local/tmp instead. */
++#define SU_PATH "/data/local/tmp/kbin/su"
+ #define SH_PATH "/system/bin/sh"
+ 
+ bool ksu_su_compat_enabled __read_mostly = true;
+@@ -176,6 +179,7 @@
+     if (unlikely(!filename_user))
+         goto do_orig_execve;
+ 
++    /* Per-app authorisation: only uids present in the allowlist may gain root. */
+     if (!ksu_is_allow_uid_for_current(current_uid().val))
+         goto do_orig_execve;
+ 
+diff -ruN --strip-trailing-cr a/kernel/hook/arm64/patch_memory.c b/kernel/hook/arm64/patch_memory.c
+--- a/kernel/hook/arm64/patch_memory.c	2026-11-12 10:30:25.757376900 +0800
++++ b/kernel/hook/arm64/patch_memory.c	2026-11-12 10:30:25.879266500 +0800
+@@ -12,7 +12,9 @@
+ #include "linux/uaccess.h"
+ #include "linux/stop_machine.h"
+ #include "asm/cacheflush.h"
++#include <linux/set_memory.h>
+ #include "asm-generic/fixmap.h"
++#include "ext_fns.h"
+ 
+ // https://github.com/fuqiuluo/ovo/blob/f7da411458e87d32438dc14fce5a3313ed0c967e/ovo/mmuhack.c#L21
+ 
+@@ -130,22 +132,21 @@
+ // ^2: https://github.com/torvalds/linux/commit/c0eb315ad9719e41ce44708455cc69df7ac9f3f8
+ static int ksu_patch_text_nosync(void *dst, void *src, size_t len, int flags)
+ {
+-    pr_debug("patch dst=0x%lx src=0x%lx len=%ld\n", (unsigned long)dst, (unsigned long)src, len);
+-
+     unsigned long p = (unsigned long)dst;
++    int phy_err;
++    unsigned long phy;
++    void *map;
+     int ret;
+ 
+-    int phy_err;
+-    unsigned long phy = phys_from_virt(p, &phy_err);
++    phy = phys_from_virt(p, &phy_err);
+     if (phy_err) {
+-        ret = phy_err;
+-        pr_err("failed to find phy addr for patch dst addr 0x%lx\n", p);
+-        goto err;
++        pr_err("KSUBC: phys_from_virt failed for 0x%lx err=%d\n", p, phy_err);
++        return phy_err;
+     }
+-    pr_debug("phy addr for patch 0x%lx: 0x%lx\n", p, phy);
+ 
+-    void *map = set_fixmap_offset(FIX_TEXT_POKE0, phy);
+-    pr_debug("fixmap addr for patch 0x%lx: 0x%lx\n", p, (unsigned long)map);
++    map = set_fixmap_offset(FIX_TEXT_POKE0, phy);
++    pr_info("KSUBC: patch 0x%lx (phys 0x%lx) via fixmap 0x%lx len=%zu\n",
++            p, phy, (unsigned long)map, len);
+ 
+     ret = (int)copy_to_kernel_nofault(map, src, len);
+ 
+@@ -158,8 +159,7 @@
+             ksu_flush_dcache(dst, len);
+     }
+ 
+-err:
+-    pr_debug("patch result=%d\n", ret);
++    pr_info("KSUBC: patch done ret=%d\n", ret);
+     return ret;
+ }
+ 
+diff -ruN --strip-trailing-cr a/kernel/hook/arm64/syscall_hook.c b/kernel/hook/arm64/syscall_hook.c
+--- a/kernel/hook/arm64/syscall_hook.c	2026-11-12 10:30:25.757376900 +0800
++++ b/kernel/hook/arm64/syscall_hook.c	2026-11-12 10:30:25.878581700 +0800
+@@ -3,12 +3,15 @@
+ #include "../syscall_hook.h"
+ 
+ #include <linux/kallsyms.h>
++#include <linux/stop_machine.h>
++#include <linux/cpumask.h>
+ #include <linux/mutex.h>
+ #include <asm/cacheflush.h>
+ #include "infra/symbol_resolver.h"
+ #include "../patch_memory.h"
+ #include "arch.h"
+ #include "klog.h" // IWYU pragma: keep
++#include "ext_fns.h"
+ 
+ syscall_fn_t *ksu_syscall_table = NULL;
+ int ksu_dispatcher_nr = -1;
+@@ -122,7 +125,15 @@
+     if (!ksu_syscall_table || max_slots <= 0)
+         return 0;
+ 
+-    ni_syscall = (unsigned long)ksu_resolve_symbol_for_functable_hook("__arm64_sys_ni_syscall");
++    /* The syscall table stores CFI jump-table thunks, not the function bodies,
++     * so the .cfi_jt alias is what actually appears in sys_call_table[].
++     * (ksu_resolve_symbol_for_functable_hook knows this too, but its fallback
++     * does a full kallsyms scan that hard-resets this kernel.) */
++    ni_syscall = (unsigned long)kallsyms_lookup_name("__arm64_sys_ni_syscall.cfi_jt");
++    if (!ni_syscall)
++        ni_syscall = (unsigned long)kallsyms_lookup_name("__arm64_sys_ni_syscall");
++    if (!ni_syscall)
++        ni_syscall = (unsigned long)kallsyms_lookup_name("sys_ni_syscall");
+ 
+     pr_info("sys_ni_syscall: 0x%lx\n", ni_syscall);
+ 
+@@ -130,6 +141,9 @@
+         return 0;
+ 
+     for (i = 0; i < __NR_syscalls && count < max_slots; i++) {
++        if ((i & 0x3f) == 0)
++            pr_info("KSUBC: scan %d of %d table=0x%lx\n", i, (int)__NR_syscalls,
++                    (unsigned long)ksu_syscall_table);
+         if ((unsigned long)ksu_syscall_table[i] == ni_syscall) {
+             out_slots[count++] = i;
+             pr_info("ni_syscall %d: %d\n", count, i);
+@@ -197,14 +211,35 @@
+     return READ_ONCE(syscall_hooks[nr]) != NULL;
+ }
+ 
++static int ksu_bisect_sm_cb(void *arg)
++{
++    (void)arg;
++    return 0;
++}
++
+ void __init ksu_syscall_hook_init(void)
+ {
+     int ni_slot;
+ 
++
+     memset(syscall_hooks, 0, sizeof(syscall_hooks));
+ 
+-    ksu_syscall_table = (syscall_fn_t *)ksu_resolve_symbol_for_functable_hook("sys_call_table");
+-    pr_info("sys_call_table=0x%lx", (unsigned long)ksu_syscall_table);
++    /* ksu_resolve_symbol_for_functable_hook() falls back to a full kallsyms
++     * scan on 5.10 and that path hard-resets this kernel. kallsyms_lookup_name
++     * is a plain exported symbol and every shim pointer was already resolved
++     * through it, so use it directly. */
++    ksu_syscall_table = (syscall_fn_t *)kallsyms_lookup_name("sys_call_table");
++    pr_info("KSUBC: 6a sys_call_table=0x%lx", (unsigned long)ksu_syscall_table);
++    if (!ksu_syscall_table)
++        return;
++    if (ksu_find_ni_syscall_slots(&ni_slot, 1) < 1) {
++        pr_err("failed to find ni_syscall slot for dispatcher\n");
++        return;
++    }
++    pr_info("KSUBC: 6b ni_slot=%d\n", ni_slot);
++    ksu_dispatcher_nr = ni_slot;
++    ksu_syscall_table_hook(ksu_dispatcher_nr, (syscall_fn_t)ksu_syscall_dispatcher, NULL);
++    pr_info("KSUBC: dispatcher installed at %d\n", ksu_dispatcher_nr);
+ 
+     if (!ksu_syscall_table)
+         return;
+diff -ruN --strip-trailing-cr a/kernel/hook/lsm_hook.c b/kernel/hook/lsm_hook.c
+--- a/kernel/hook/lsm_hook.c	2026-11-12 10:30:25.767689300 +0800
++++ b/kernel/hook/lsm_hook.c	2026-11-12 10:30:25.879812900 +0800
+@@ -13,6 +13,7 @@
+ #include "klog.h" // IWYU pragma: keep
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+ #include "linux/static_call.h"
++#include "ext_fns.h"
+ #endif
+ struct ksu_lsm_hook_entry {
+     struct ksu_lsm_hook *hook;
+diff -ruN --strip-trailing-cr a/kernel/hook/syscall_hook_manager.c b/kernel/hook/syscall_hook_manager.c
+--- a/kernel/hook/syscall_hook_manager.c	2026-11-12 10:30:25.766588800 +0800
++++ b/kernel/hook/syscall_hook_manager.c	2026-11-12 10:30:25.892941500 +0800
+@@ -21,6 +21,7 @@
+ #include "hook/setuid_hook.h"
+ #include "hook/syscall_hook.h"
+ #include "hook/syscall_event_bridge.h"
++#include "ext_fns.h"
+ 
+ #ifdef CONFIG_KRETPROBES
+ 
+@@ -139,7 +140,14 @@
+     ksu_register_syscall_hook(__NR_faccessat, ksu_hook_faccessat);
+ 
+ #ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
+-    ret = register_trace_prio_sys_enter(ksu_sys_enter_handler, NULL, INT_MIN);
++    /* register_trace_prio_sys_enter() expands to a registration against the
++     * symbol __tracepoint_sys_enter, which this module can only provide as a
++     * *copy* of the real tracepoint struct. Registering into that copy leaves
++     * the kernel's real tracepoint untouched, so the callback never runs.
++     * Register against the real struct instead. */
++    ret = tracepoint_probe_register_prio(
++        (struct tracepoint *)ksu_ext_p___tracepoint_sys_enter,
++        ksu_sys_enter_handler, NULL, INT_MIN);
+ #ifndef CONFIG_KRETPROBES
+     ksu_mark_running_process_locked();
+ #endif
+diff -ruN --strip-trailing-cr a/kernel/hook/x86_64/patch_memory.c b/kernel/hook/x86_64/patch_memory.c
+--- a/kernel/hook/x86_64/patch_memory.c	2026-11-12 10:30:25.770867800 +0800
++++ b/kernel/hook/x86_64/patch_memory.c	2026-11-12 10:30:25.890778200 +0800
+@@ -18,6 +18,7 @@
+ #include <asm/pgtable.h>
+ #include <asm/page.h>
+ #include <asm/fixmap.h>
++#include "ext_fns.h"
+ 
+ // --- Architecture-specific Page Table to Physical Address translation ---
+ #define KSU_P4D_TO_PHYS(p4d) ((unsigned long)p4d_pfn(p4d) << PAGE_SHIFT)
+diff -ruN --strip-trailing-cr a/kernel/include/ext_fns.h b/kernel/include/ext_fns.h
+--- a/kernel/include/ext_fns.h	1970-01-01 08:00:00.000000000 +0800
++++ b/kernel/include/ext_fns.h	2026-11-12 10:30:25.896963300 +0800
+@@ -0,0 +1,82 @@
++#ifndef KSU_EXT_FNS_H
++#define KSU_EXT_FNS_H
++
++/* Honor ALI-AN00: kernel does not EXPORT_SYMBOL these, so resolve at runtime. */
++int ksu_ext_syms_init(void);
++
++extern void *ksu_ext_p___arm64_sys_setns;
++extern void *ksu_ext_p___cfi_slowpath_diag;
++extern void *ksu_ext_p___flush_dcache_area;
++extern void *ksu_ext_p___hashtab_insert;
++extern void *ksu_ext_p___rcu_read_lock;
++extern void *ksu_ext_p___rcu_read_unlock;
++extern void *ksu_ext_p___set_fixmap;
++extern void *ksu_ext_p___ubsan_handle_cfi_check_fail;
++extern void *ksu_ext_p_alloc_uid;
++extern void *ksu_ext_p_avc_has_perm;
++extern void *ksu_ext_p_avc_ss_reset;
++extern void *ksu_ext_p_avtab_alloc;
++extern void *ksu_ext_p_avtab_destroy;
++extern void *ksu_ext_p_avtab_insert_nonunique;
++extern void *ksu_ext_p_avtab_search_node;
++extern void *ksu_ext_p_avtab_search_node_next;
++extern void *ksu_ext_p_change_pid;
++extern void *ksu_ext_p_copy_to_kernel_nofault;
++extern void *ksu_ext_p_ebitmap_get_bit;
++extern void *ksu_ext_p_ebitmap_set_bit;
++extern void *ksu_ext_p_ext4_unregister_sysfs;
++extern void *ksu_ext_p_kallsyms_lookup;
++extern void *ksu_ext_p_kallsyms_lookup_size_offset;
++extern void *ksu_ext_p_ksys_unshare;
++extern void *ksu_ext_p_ns_get_path;
++extern void *ksu_ext_p_path_mount;
++extern void *ksu_ext_p_path_umount;
++extern void *ksu_ext_p_policydb_destroy;
++extern void *ksu_ext_p_policydb_filenametr_search;
++extern void *ksu_ext_p_policydb_load_isids;
++extern void *ksu_ext_p_policydb_read;
++extern void *ksu_ext_p_policydb_write;
++extern void *ksu_ext_p_seccomp_filter_release;
++extern void *ksu_ext_p_security_compute_av_user;
++extern void *ksu_ext_p_security_context_str_to_sid;
++extern void *ksu_ext_p_security_context_to_sid;
++extern void *ksu_ext_p_security_inode_init_security_anon;
++extern void *ksu_ext_p_security_sid_to_context;
++extern void *ksu_ext_p_selinux_status_update_policyload;
++extern void *ksu_ext_p_selnl_notify_policyload;
++extern void *ksu_ext_p_set_fs_pwd;
++extern void *ksu_ext_p_sidtab_destroy;
++extern void *ksu_ext_p_strncpy_from_user_nofault;
++extern void *ksu_ext_p_symtab_insert;
++extern void *ksu_ext_p_symtab_search;
++extern void *ksu_ext_p_task_work_add;
++extern void *ksu_ext_p___tracepoint_sys_enter;
++extern void *ksu_ext_p_init_mm;
++extern void *ksu_ext_p_mntns_operations;
++extern void *ksu_ext_p_param_ops_ulong;
++extern void *ksu_ext_p_selinux_blob_sizes;
++extern void *ksu_ext_p_selinux_state;
++
++/* No macro here on purpose: task_work_add() must resolve to the asm
++ * trampoline, not to an indirect call through ksu_ext_p_task_work_add.
++ * Indirect calls get a CFI type check, and the type hash for this function
++ * does not match this kernel, so HISEC resets the device. */
++
++#define __tracepoint_sys_enter (*(__typeof__(__tracepoint_sys_enter) *)ksu_ext_p___tracepoint_sys_enter)
++#define init_mm (*(__typeof__(init_mm) *)ksu_ext_p_init_mm)
++#define mntns_operations (*(__typeof__(mntns_operations) *)ksu_ext_p_mntns_operations)
++#define param_ops_ulong (*(__typeof__(param_ops_ulong) *)ksu_ext_p_param_ops_ulong)
++#define selinux_blob_sizes (*(__typeof__(selinux_blob_sizes) *)ksu_ext_p_selinux_blob_sizes)
++#define selinux_state (*(__typeof__(selinux_state) *)ksu_ext_p_selinux_state)
++
++
++extern void *ksu_ext_p_set_memory_rw;
++extern void *ksu_ext_p_set_memory_ro;
++
++
++extern void *ksu_ext_p_filp_open;
++extern void *ksu_ext_p_kernel_write;
++
++void ksu_bc(const char *msg);
++
++#endif
+diff -ruN --strip-trailing-cr a/kernel/infra/ext_fns.c b/kernel/infra/ext_fns.c
+--- a/kernel/infra/ext_fns.c	1970-01-01 08:00:00.000000000 +0800
++++ b/kernel/infra/ext_fns.c	2026-11-12 10:30:25.906042900 +0800
+@@ -0,0 +1,1092 @@
++#include <linux/kallsyms.h>
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/types.h>
++
++#include "symbol_resolver.h"
++#include "ext_fns.h"
++
++void *ksu_ext_p___arm64_sys_setns = 0;
++void *ksu_ext_p___cfi_slowpath_diag = 0;
++void *ksu_ext_p___flush_dcache_area = 0;
++void *ksu_ext_p___hashtab_insert = 0;
++void *ksu_ext_p___rcu_read_lock = 0;
++void *ksu_ext_p___rcu_read_unlock = 0;
++void *ksu_ext_p___set_fixmap = 0;
++void *ksu_ext_p___ubsan_handle_cfi_check_fail = 0;
++void *ksu_ext_p_alloc_uid = 0;
++void *ksu_ext_p_avc_has_perm = 0;
++void *ksu_ext_p_avc_ss_reset = 0;
++void *ksu_ext_p_avtab_alloc = 0;
++void *ksu_ext_p_avtab_destroy = 0;
++void *ksu_ext_p_avtab_insert_nonunique = 0;
++void *ksu_ext_p_avtab_search_node = 0;
++void *ksu_ext_p_avtab_search_node_next = 0;
++void *ksu_ext_p_change_pid = 0;
++void *ksu_ext_p_copy_to_kernel_nofault = 0;
++void *ksu_ext_p_ebitmap_get_bit = 0;
++void *ksu_ext_p_ebitmap_set_bit = 0;
++void *ksu_ext_p_ext4_unregister_sysfs = 0;
++void *ksu_ext_p_kallsyms_lookup = 0;
++void *ksu_ext_p_kallsyms_lookup_size_offset = 0;
++void *ksu_ext_p_ksys_unshare = 0;
++void *ksu_ext_p_ns_get_path = 0;
++void *ksu_ext_p_path_mount = 0;
++void *ksu_ext_p_path_umount = 0;
++void *ksu_ext_p_policydb_destroy = 0;
++void *ksu_ext_p_policydb_filenametr_search = 0;
++void *ksu_ext_p_policydb_load_isids = 0;
++void *ksu_ext_p_policydb_read = 0;
++void *ksu_ext_p_policydb_write = 0;
++void *ksu_ext_p_seccomp_filter_release = 0;
++void *ksu_ext_p_security_compute_av_user = 0;
++void *ksu_ext_p_security_context_str_to_sid = 0;
++void *ksu_ext_p_security_context_to_sid = 0;
++void *ksu_ext_p_security_inode_init_security_anon = 0;
++void *ksu_ext_p_security_sid_to_context = 0;
++void *ksu_ext_p_selinux_status_update_policyload = 0;
++void *ksu_ext_p_selnl_notify_policyload = 0;
++void *ksu_ext_p_set_fs_pwd = 0;
++void *ksu_ext_p_sidtab_destroy = 0;
++void *ksu_ext_p_strncpy_from_user_nofault = 0;
++void *ksu_ext_p_symtab_insert = 0;
++void *ksu_ext_p_symtab_search = 0;
++void *ksu_ext_p_task_work_add = 0;
++void *ksu_ext_p___tracepoint_sys_enter = 0;
++void *ksu_ext_p_init_mm = 0;
++void *ksu_ext_p_mntns_operations = 0;
++void *ksu_ext_p_param_ops_ulong = 0;
++void *ksu_ext_p_selinux_blob_sizes = 0;
++void *ksu_ext_p_selinux_state = 0;
++
++void *ksu_ext_p_set_memory_rw = 0;
++void *ksu_ext_p_filp_open = 0;
++void *ksu_ext_p_kernel_write = 0;
++void *ksu_ext_p_set_memory_ro = 0;
++
++static void *ksu_ext_resolve(const char *name)
++{
++    /* Deliberately NOT find_kernel_symbol_exact(): that helper calls
++     * kallsyms_lookup(), which is itself one of the shims being resolved here
++     * (its trampoline slot is still NULL at this point -> branch to zero).
++     * kallsyms_lookup_name is a plain exported symbol, so it breaks the cycle. */
++    unsigned long a = kallsyms_lookup_name(name);
++    if (!a) pr_warn("KSUBC: MISS %s\n", name);
++    else pr_info("KSUBC: ok %s -> %lx\n", name, a);
++    return (void *)a;
++}
++
++
++/* KSU_EXT_DATA_COPIES: two data objects the kernel does not export and that
++ * are referenced by address from inline header code. A local snapshot of each
++ * is enough for the module's read-only uses. */
++__asm__(
++    ".bss\n"
++    ".globl selinux_blob_sizes\n"
++    ".align 3\n"
++    "selinux_blob_sizes:\n"
++    "  .space 256\n"
++    ".globl __tracepoint_sys_enter\n"
++    ".align 3\n"
++    "__tracepoint_sys_enter:\n"
++    "  .space 256\n");
++
++#undef selinux_blob_sizes
++#undef __tracepoint_sys_enter
++extern char selinux_blob_sizes[];
++extern char __tracepoint_sys_enter[];
++
++static void ksu_ext_copy_data(void)
++{
++    if (ksu_ext_p_selinux_blob_sizes)
++        memcpy(selinux_blob_sizes, ksu_ext_p_selinux_blob_sizes, 256);
++    if (ksu_ext_p___tracepoint_sys_enter)
++        memcpy(__tracepoint_sys_enter, ksu_ext_p___tracepoint_sys_enter, 256);
++}
++
++static void ksu_ext_more_init(void);
++
++int ksu_ext_syms_init(void)
++{
++    pr_info("KSUBC: ext_syms_init START\n");
++    ksu_ext_p_filp_open = ksu_ext_resolve("filp_open");
++    ksu_ext_p_kernel_write = ksu_ext_resolve("kernel_write");
++
++    ksu_ext_copy_data();
++    ksu_ext_p___arm64_sys_setns = ksu_ext_resolve("__arm64_sys_setns");
++    ksu_ext_p___cfi_slowpath_diag = ksu_ext_resolve("__cfi_slowpath_diag");
++    ksu_ext_p___flush_dcache_area = ksu_ext_resolve("__flush_dcache_area");
++    ksu_ext_p___hashtab_insert = ksu_ext_resolve("__hashtab_insert");
++    ksu_ext_p___rcu_read_lock = ksu_ext_resolve("__rcu_read_lock");
++    ksu_ext_p___rcu_read_unlock = ksu_ext_resolve("__rcu_read_unlock");
++    ksu_ext_p___set_fixmap = ksu_ext_resolve("__set_fixmap");
++    ksu_ext_p___ubsan_handle_cfi_check_fail = ksu_ext_resolve("__ubsan_handle_cfi_check_fail");
++    ksu_ext_p_alloc_uid = ksu_ext_resolve("alloc_uid");
++    ksu_ext_p_avc_has_perm = ksu_ext_resolve("avc_has_perm");
++    ksu_ext_p_avc_ss_reset = ksu_ext_resolve("avc_ss_reset");
++    ksu_ext_p_avtab_alloc = ksu_ext_resolve("avtab_alloc");
++    ksu_ext_p_avtab_destroy = ksu_ext_resolve("avtab_destroy");
++    ksu_ext_p_avtab_insert_nonunique = ksu_ext_resolve("avtab_insert_nonunique");
++    ksu_ext_p_avtab_search_node = ksu_ext_resolve("avtab_search_node");
++    ksu_ext_p_avtab_search_node_next = ksu_ext_resolve("avtab_search_node_next");
++    ksu_ext_p_change_pid = ksu_ext_resolve("change_pid");
++    ksu_ext_p_copy_to_kernel_nofault = ksu_ext_resolve("copy_to_kernel_nofault");
++    ksu_ext_p_ebitmap_get_bit = ksu_ext_resolve("ebitmap_get_bit");
++    ksu_ext_p_ebitmap_set_bit = ksu_ext_resolve("ebitmap_set_bit");
++    ksu_ext_p_ext4_unregister_sysfs = ksu_ext_resolve("ext4_unregister_sysfs");
++    ksu_ext_p_kallsyms_lookup = ksu_ext_resolve("kallsyms_lookup");
++    ksu_ext_p_kallsyms_lookup_size_offset = ksu_ext_resolve("kallsyms_lookup_size_offset");
++    ksu_ext_p_ksys_unshare = ksu_ext_resolve("ksys_unshare");
++    ksu_ext_p_ns_get_path = ksu_ext_resolve("ns_get_path");
++    ksu_ext_p_path_mount = ksu_ext_resolve("path_mount");
++    ksu_ext_p_path_umount = ksu_ext_resolve("path_umount");
++    ksu_ext_p_policydb_destroy = ksu_ext_resolve("policydb_destroy");
++    ksu_ext_p_policydb_filenametr_search = ksu_ext_resolve("policydb_filenametr_search");
++    ksu_ext_p_policydb_load_isids = ksu_ext_resolve("policydb_load_isids");
++    ksu_ext_p_policydb_read = ksu_ext_resolve("policydb_read");
++    ksu_ext_p_policydb_write = ksu_ext_resolve("policydb_write");
++    ksu_ext_p_seccomp_filter_release = ksu_ext_resolve("seccomp_filter_release");
++    ksu_ext_p_security_compute_av_user = ksu_ext_resolve("security_compute_av_user");
++    ksu_ext_p_security_context_str_to_sid = ksu_ext_resolve("security_context_str_to_sid");
++    ksu_ext_p_security_context_to_sid = ksu_ext_resolve("security_context_to_sid");
++    ksu_ext_p_security_inode_init_security_anon = ksu_ext_resolve("security_inode_init_security_anon");
++    ksu_ext_p_security_sid_to_context = ksu_ext_resolve("security_sid_to_context");
++    ksu_ext_p_selinux_status_update_policyload = ksu_ext_resolve("selinux_status_update_policyload");
++    ksu_ext_p_selnl_notify_policyload = ksu_ext_resolve("selnl_notify_policyload");
++    ksu_ext_p_set_fs_pwd = ksu_ext_resolve("set_fs_pwd");
++    ksu_ext_p_sidtab_destroy = ksu_ext_resolve("sidtab_destroy");
++    ksu_ext_p_strncpy_from_user_nofault = ksu_ext_resolve("strncpy_from_user_nofault");
++    ksu_ext_p_symtab_insert = ksu_ext_resolve("symtab_insert");
++    ksu_ext_p_symtab_search = ksu_ext_resolve("symtab_search");
++    ksu_ext_p_task_work_add = ksu_ext_resolve("task_work_add");
++    ksu_ext_p___tracepoint_sys_enter = ksu_ext_resolve("__tracepoint_sys_enter");
++    ksu_ext_p_init_mm = ksu_ext_resolve("init_mm");
++    ksu_ext_p_mntns_operations = ksu_ext_resolve("mntns_operations");
++    ksu_ext_p_param_ops_ulong = ksu_ext_resolve("param_ops_ulong");
++    ksu_ext_p_selinux_blob_sizes = ksu_ext_resolve("selinux_blob_sizes");
++    ksu_ext_p_selinux_state = ksu_ext_resolve("selinux_state");
++    ksu_ext_p_set_memory_rw = ksu_ext_resolve("set_memory_rw");
++    ksu_ext_p_set_memory_ro = ksu_ext_resolve("set_memory_ro");
++    ksu_ext_more_init();
++    return 0;
++}
++
++/* KSU_EXT_TRAMPOLINES: link-level tail-call stubs. The kernel does not
++ * EXPORT_SYMBOL these, and many references are emitted from inline
++ * functions in headers, so a preprocessor alias cannot catch them.
++ * Defining the symbol here stops the module loader from looking it up. */
++
++__asm__(
++    ".text\n"
++    ".globl __arm64_sys_setns\n"
++    ".type __arm64_sys_setns, %function\n"
++    "__arm64_sys_setns:\n"
++    "  adrp x16, ksu_ext_p___arm64_sys_setns\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p___arm64_sys_setns]\n"
++    "  br x16\n"
++    ".size __arm64_sys_setns, .-__arm64_sys_setns\n");
++
++__asm__(
++    ".text\n"
++    ".globl __cfi_slowpath_diag\n"
++    ".type __cfi_slowpath_diag, %function\n"
++    "__cfi_slowpath_diag:\n"
++    "  adrp x16, ksu_ext_p___cfi_slowpath_diag\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p___cfi_slowpath_diag]\n"
++    "  br x16\n"
++    ".size __cfi_slowpath_diag, .-__cfi_slowpath_diag\n");
++
++__asm__(
++    ".text\n"
++    ".globl __flush_dcache_area\n"
++    ".type __flush_dcache_area, %function\n"
++    "__flush_dcache_area:\n"
++    "  adrp x16, ksu_ext_p___flush_dcache_area\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p___flush_dcache_area]\n"
++    "  br x16\n"
++    ".size __flush_dcache_area, .-__flush_dcache_area\n");
++
++__asm__(
++    ".text\n"
++    ".globl __hashtab_insert\n"
++    ".type __hashtab_insert, %function\n"
++    "__hashtab_insert:\n"
++    "  adrp x16, ksu_ext_p___hashtab_insert\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p___hashtab_insert]\n"
++    "  br x16\n"
++    ".size __hashtab_insert, .-__hashtab_insert\n");
++
++__asm__(
++    ".text\n"
++    ".globl __rcu_read_lock\n"
++    ".type __rcu_read_lock, %function\n"
++    "__rcu_read_lock:\n"
++    "  adrp x16, ksu_ext_p___rcu_read_lock\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p___rcu_read_lock]\n"
++    "  br x16\n"
++    ".size __rcu_read_lock, .-__rcu_read_lock\n");
++
++__asm__(
++    ".text\n"
++    ".globl __rcu_read_unlock\n"
++    ".type __rcu_read_unlock, %function\n"
++    "__rcu_read_unlock:\n"
++    "  adrp x16, ksu_ext_p___rcu_read_unlock\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p___rcu_read_unlock]\n"
++    "  br x16\n"
++    ".size __rcu_read_unlock, .-__rcu_read_unlock\n");
++
++__asm__(
++    ".text\n"
++    ".globl __set_fixmap\n"
++    ".type __set_fixmap, %function\n"
++    "__set_fixmap:\n"
++    "  adrp x16, ksu_ext_p___set_fixmap\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p___set_fixmap]\n"
++    "  br x16\n"
++    ".size __set_fixmap, .-__set_fixmap\n");
++
++__asm__(
++    ".text\n"
++    ".globl __ubsan_handle_cfi_check_fail\n"
++    ".type __ubsan_handle_cfi_check_fail, %function\n"
++    "__ubsan_handle_cfi_check_fail:\n"
++    "  adrp x16, ksu_ext_p___ubsan_handle_cfi_check_fail\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p___ubsan_handle_cfi_check_fail]\n"
++    "  br x16\n"
++    ".size __ubsan_handle_cfi_check_fail, .-__ubsan_handle_cfi_check_fail\n");
++
++__asm__(
++    ".text\n"
++    ".globl alloc_uid\n"
++    ".type alloc_uid, %function\n"
++    "alloc_uid:\n"
++    "  adrp x16, ksu_ext_p_alloc_uid\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_alloc_uid]\n"
++    "  br x16\n"
++    ".size alloc_uid, .-alloc_uid\n");
++
++__asm__(
++    ".text\n"
++    ".globl avc_has_perm\n"
++    ".type avc_has_perm, %function\n"
++    "avc_has_perm:\n"
++    "  adrp x16, ksu_ext_p_avc_has_perm\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_avc_has_perm]\n"
++    "  br x16\n"
++    ".size avc_has_perm, .-avc_has_perm\n");
++
++__asm__(
++    ".text\n"
++    ".globl avc_ss_reset\n"
++    ".type avc_ss_reset, %function\n"
++    "avc_ss_reset:\n"
++    "  adrp x16, ksu_ext_p_avc_ss_reset\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_avc_ss_reset]\n"
++    "  br x16\n"
++    ".size avc_ss_reset, .-avc_ss_reset\n");
++
++__asm__(
++    ".text\n"
++    ".globl avtab_alloc\n"
++    ".type avtab_alloc, %function\n"
++    "avtab_alloc:\n"
++    "  adrp x16, ksu_ext_p_avtab_alloc\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_avtab_alloc]\n"
++    "  br x16\n"
++    ".size avtab_alloc, .-avtab_alloc\n");
++
++__asm__(
++    ".text\n"
++    ".globl avtab_destroy\n"
++    ".type avtab_destroy, %function\n"
++    "avtab_destroy:\n"
++    "  adrp x16, ksu_ext_p_avtab_destroy\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_avtab_destroy]\n"
++    "  br x16\n"
++    ".size avtab_destroy, .-avtab_destroy\n");
++
++__asm__(
++    ".text\n"
++    ".globl avtab_insert_nonunique\n"
++    ".type avtab_insert_nonunique, %function\n"
++    "avtab_insert_nonunique:\n"
++    "  adrp x16, ksu_ext_p_avtab_insert_nonunique\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_avtab_insert_nonunique]\n"
++    "  br x16\n"
++    ".size avtab_insert_nonunique, .-avtab_insert_nonunique\n");
++
++__asm__(
++    ".text\n"
++    ".globl avtab_search_node\n"
++    ".type avtab_search_node, %function\n"
++    "avtab_search_node:\n"
++    "  adrp x16, ksu_ext_p_avtab_search_node\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_avtab_search_node]\n"
++    "  br x16\n"
++    ".size avtab_search_node, .-avtab_search_node\n");
++
++__asm__(
++    ".text\n"
++    ".globl avtab_search_node_next\n"
++    ".type avtab_search_node_next, %function\n"
++    "avtab_search_node_next:\n"
++    "  adrp x16, ksu_ext_p_avtab_search_node_next\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_avtab_search_node_next]\n"
++    "  br x16\n"
++    ".size avtab_search_node_next, .-avtab_search_node_next\n");
++
++__asm__(
++    ".text\n"
++    ".globl change_pid\n"
++    ".type change_pid, %function\n"
++    "change_pid:\n"
++    "  adrp x16, ksu_ext_p_change_pid\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_change_pid]\n"
++    "  br x16\n"
++    ".size change_pid, .-change_pid\n");
++
++__asm__(
++    ".text\n"
++    ".globl copy_to_kernel_nofault\n"
++    ".type copy_to_kernel_nofault, %function\n"
++    "copy_to_kernel_nofault:\n"
++    "  adrp x16, ksu_ext_p_copy_to_kernel_nofault\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_copy_to_kernel_nofault]\n"
++    "  br x16\n"
++    ".size copy_to_kernel_nofault, .-copy_to_kernel_nofault\n");
++
++__asm__(
++    ".text\n"
++    ".globl ebitmap_get_bit\n"
++    ".type ebitmap_get_bit, %function\n"
++    "ebitmap_get_bit:\n"
++    "  adrp x16, ksu_ext_p_ebitmap_get_bit\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_ebitmap_get_bit]\n"
++    "  br x16\n"
++    ".size ebitmap_get_bit, .-ebitmap_get_bit\n");
++
++__asm__(
++    ".text\n"
++    ".globl ebitmap_set_bit\n"
++    ".type ebitmap_set_bit, %function\n"
++    "ebitmap_set_bit:\n"
++    "  adrp x16, ksu_ext_p_ebitmap_set_bit\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_ebitmap_set_bit]\n"
++    "  br x16\n"
++    ".size ebitmap_set_bit, .-ebitmap_set_bit\n");
++
++__asm__(
++    ".text\n"
++    ".globl ext4_unregister_sysfs\n"
++    ".type ext4_unregister_sysfs, %function\n"
++    "ext4_unregister_sysfs:\n"
++    "  adrp x16, ksu_ext_p_ext4_unregister_sysfs\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_ext4_unregister_sysfs]\n"
++    "  br x16\n"
++    ".size ext4_unregister_sysfs, .-ext4_unregister_sysfs\n");
++
++__asm__(
++    ".text\n"
++    ".globl kallsyms_lookup\n"
++    ".type kallsyms_lookup, %function\n"
++    "kallsyms_lookup:\n"
++    "  adrp x16, ksu_ext_p_kallsyms_lookup\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_kallsyms_lookup]\n"
++    "  br x16\n"
++    ".size kallsyms_lookup, .-kallsyms_lookup\n");
++
++__asm__(
++    ".text\n"
++    ".globl kallsyms_lookup_size_offset\n"
++    ".type kallsyms_lookup_size_offset, %function\n"
++    "kallsyms_lookup_size_offset:\n"
++    "  adrp x16, ksu_ext_p_kallsyms_lookup_size_offset\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_kallsyms_lookup_size_offset]\n"
++    "  br x16\n"
++    ".size kallsyms_lookup_size_offset, .-kallsyms_lookup_size_offset\n");
++
++__asm__(
++    ".text\n"
++    ".globl ksys_unshare\n"
++    ".type ksys_unshare, %function\n"
++    "ksys_unshare:\n"
++    "  adrp x16, ksu_ext_p_ksys_unshare\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_ksys_unshare]\n"
++    "  br x16\n"
++    ".size ksys_unshare, .-ksys_unshare\n");
++
++__asm__(
++    ".text\n"
++    ".globl ns_get_path\n"
++    ".type ns_get_path, %function\n"
++    "ns_get_path:\n"
++    "  adrp x16, ksu_ext_p_ns_get_path\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_ns_get_path]\n"
++    "  br x16\n"
++    ".size ns_get_path, .-ns_get_path\n");
++
++__asm__(
++    ".text\n"
++    ".globl path_mount\n"
++    ".type path_mount, %function\n"
++    "path_mount:\n"
++    "  adrp x16, ksu_ext_p_path_mount\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_path_mount]\n"
++    "  br x16\n"
++    ".size path_mount, .-path_mount\n");
++
++__asm__(
++    ".text\n"
++    ".globl path_umount\n"
++    ".type path_umount, %function\n"
++    "path_umount:\n"
++    "  adrp x16, ksu_ext_p_path_umount\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_path_umount]\n"
++    "  br x16\n"
++    ".size path_umount, .-path_umount\n");
++
++__asm__(
++    ".text\n"
++    ".globl policydb_destroy\n"
++    ".type policydb_destroy, %function\n"
++    "policydb_destroy:\n"
++    "  adrp x16, ksu_ext_p_policydb_destroy\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_policydb_destroy]\n"
++    "  br x16\n"
++    ".size policydb_destroy, .-policydb_destroy\n");
++
++__asm__(
++    ".text\n"
++    ".globl policydb_filenametr_search\n"
++    ".type policydb_filenametr_search, %function\n"
++    "policydb_filenametr_search:\n"
++    "  adrp x16, ksu_ext_p_policydb_filenametr_search\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_policydb_filenametr_search]\n"
++    "  br x16\n"
++    ".size policydb_filenametr_search, .-policydb_filenametr_search\n");
++
++__asm__(
++    ".text\n"
++    ".globl policydb_load_isids\n"
++    ".type policydb_load_isids, %function\n"
++    "policydb_load_isids:\n"
++    "  adrp x16, ksu_ext_p_policydb_load_isids\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_policydb_load_isids]\n"
++    "  br x16\n"
++    ".size policydb_load_isids, .-policydb_load_isids\n");
++
++__asm__(
++    ".text\n"
++    ".globl policydb_read\n"
++    ".type policydb_read, %function\n"
++    "policydb_read:\n"
++    "  adrp x16, ksu_ext_p_policydb_read\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_policydb_read]\n"
++    "  br x16\n"
++    ".size policydb_read, .-policydb_read\n");
++
++__asm__(
++    ".text\n"
++    ".globl policydb_write\n"
++    ".type policydb_write, %function\n"
++    "policydb_write:\n"
++    "  adrp x16, ksu_ext_p_policydb_write\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_policydb_write]\n"
++    "  br x16\n"
++    ".size policydb_write, .-policydb_write\n");
++
++__asm__(
++    ".text\n"
++    ".globl seccomp_filter_release\n"
++    ".type seccomp_filter_release, %function\n"
++    "seccomp_filter_release:\n"
++    "  adrp x16, ksu_ext_p_seccomp_filter_release\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_seccomp_filter_release]\n"
++    "  br x16\n"
++    ".size seccomp_filter_release, .-seccomp_filter_release\n");
++
++__asm__(
++    ".text\n"
++    ".globl security_compute_av_user\n"
++    ".type security_compute_av_user, %function\n"
++    "security_compute_av_user:\n"
++    "  adrp x16, ksu_ext_p_security_compute_av_user\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_security_compute_av_user]\n"
++    "  br x16\n"
++    ".size security_compute_av_user, .-security_compute_av_user\n");
++
++__asm__(
++    ".text\n"
++    ".globl security_context_str_to_sid\n"
++    ".type security_context_str_to_sid, %function\n"
++    "security_context_str_to_sid:\n"
++    "  adrp x16, ksu_ext_p_security_context_str_to_sid\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_security_context_str_to_sid]\n"
++    "  br x16\n"
++    ".size security_context_str_to_sid, .-security_context_str_to_sid\n");
++
++__asm__(
++    ".text\n"
++    ".globl security_context_to_sid\n"
++    ".type security_context_to_sid, %function\n"
++    "security_context_to_sid:\n"
++    "  adrp x16, ksu_ext_p_security_context_to_sid\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_security_context_to_sid]\n"
++    "  br x16\n"
++    ".size security_context_to_sid, .-security_context_to_sid\n");
++
++__asm__(
++    ".text\n"
++    ".globl security_inode_init_security_anon\n"
++    ".type security_inode_init_security_anon, %function\n"
++    "security_inode_init_security_anon:\n"
++    "  adrp x16, ksu_ext_p_security_inode_init_security_anon\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_security_inode_init_security_anon]\n"
++    "  br x16\n"
++    ".size security_inode_init_security_anon, .-security_inode_init_security_anon\n");
++
++__asm__(
++    ".text\n"
++    ".globl security_sid_to_context\n"
++    ".type security_sid_to_context, %function\n"
++    "security_sid_to_context:\n"
++    "  adrp x16, ksu_ext_p_security_sid_to_context\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_security_sid_to_context]\n"
++    "  br x16\n"
++    ".size security_sid_to_context, .-security_sid_to_context\n");
++
++__asm__(
++    ".text\n"
++    ".globl selinux_status_update_policyload\n"
++    ".type selinux_status_update_policyload, %function\n"
++    "selinux_status_update_policyload:\n"
++    "  adrp x16, ksu_ext_p_selinux_status_update_policyload\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_selinux_status_update_policyload]\n"
++    "  br x16\n"
++    ".size selinux_status_update_policyload, .-selinux_status_update_policyload\n");
++
++__asm__(
++    ".text\n"
++    ".globl selnl_notify_policyload\n"
++    ".type selnl_notify_policyload, %function\n"
++    "selnl_notify_policyload:\n"
++    "  adrp x16, ksu_ext_p_selnl_notify_policyload\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_selnl_notify_policyload]\n"
++    "  br x16\n"
++    ".size selnl_notify_policyload, .-selnl_notify_policyload\n");
++
++__asm__(
++    ".text\n"
++    ".globl set_fs_pwd\n"
++    ".type set_fs_pwd, %function\n"
++    "set_fs_pwd:\n"
++    "  adrp x16, ksu_ext_p_set_fs_pwd\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_set_fs_pwd]\n"
++    "  br x16\n"
++    ".size set_fs_pwd, .-set_fs_pwd\n");
++
++__asm__(
++    ".text\n"
++    ".globl sidtab_destroy\n"
++    ".type sidtab_destroy, %function\n"
++    "sidtab_destroy:\n"
++    "  adrp x16, ksu_ext_p_sidtab_destroy\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_sidtab_destroy]\n"
++    "  br x16\n"
++    ".size sidtab_destroy, .-sidtab_destroy\n");
++
++__asm__(
++    ".text\n"
++    ".globl strncpy_from_user_nofault\n"
++    ".type strncpy_from_user_nofault, %function\n"
++    "strncpy_from_user_nofault:\n"
++    "  adrp x16, ksu_ext_p_strncpy_from_user_nofault\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_strncpy_from_user_nofault]\n"
++    "  br x16\n"
++    ".size strncpy_from_user_nofault, .-strncpy_from_user_nofault\n");
++
++__asm__(
++    ".text\n"
++    ".globl symtab_insert\n"
++    ".type symtab_insert, %function\n"
++    "symtab_insert:\n"
++    "  adrp x16, ksu_ext_p_symtab_insert\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_symtab_insert]\n"
++    "  br x16\n"
++    ".size symtab_insert, .-symtab_insert\n");
++
++__asm__(
++    ".text\n"
++    ".globl symtab_search\n"
++    ".type symtab_search, %function\n"
++    "symtab_search:\n"
++    "  adrp x16, ksu_ext_p_symtab_search\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_symtab_search]\n"
++    "  br x16\n"
++    ".size symtab_search, .-symtab_search\n");
++
++__asm__(
++    ".text\n"
++    ".globl task_work_add\n"
++    ".type task_work_add, %function\n"
++    "task_work_add:\n"
++    "  adrp x16, ksu_ext_p_task_work_add\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_task_work_add]\n"
++    "  br x16\n"
++    ".size task_work_add, .-task_work_add\n");
++
++/* ---- round 2: symbols trimmed on the device by CONFIG_TRIM_UNUSED_KSYMS ---- */
++void *ksu_ext_p___put_cred = 0;
++void *ksu_ext_p__copy_to_iter = 0;
++void *ksu_ext_p_abort_creds = 0;
++void *ksu_ext_p_alloc_file_pseudo = 0;
++void *ksu_ext_p_bin2hex = 0;
++void *ksu_ext_p_commit_creds = 0;
++void *ksu_ext_p_copy_from_user_nofault = 0;
++void *ksu_ext_p_copy_to_user_nofault = 0;
++void *ksu_ext_p_dentry_open = 0;
++void *ksu_ext_p_free_uid = 0;
++void *ksu_ext_p_fsnotify_add_mark = 0;
++void *ksu_ext_p_fsnotify_alloc_group = 0;
++void *ksu_ext_p_fsnotify_destroy_mark = 0;
++void *ksu_ext_p_fsnotify_init_mark = 0;
++void *ksu_ext_p_fsnotify_put_group = 0;
++void *ksu_ext_p_fsnotify_put_mark = 0;
++void *ksu_ext_p_full_name_hash = 0;
++void *ksu_ext_p_get_task_cred = 0;
++void *ksu_ext_p_groups_alloc = 0;
++void *ksu_ext_p_groups_free = 0;
++void *ksu_ext_p_groups_sort = 0;
++void *ksu_ext_p_ihold = 0;
++void *ksu_ext_p_init_pid_ns = 0;
++void *ksu_ext_p_iterate_dir = 0;
++void *ksu_ext_p_override_creds = 0;
++void *ksu_ext_p_path_get = 0;
++void *ksu_ext_p_prepare_creds = 0;
++void *ksu_ext_p_revert_creds = 0;
++void *ksu_ext_p_security_release_secctx = 0;
++void *ksu_ext_p_security_secctx_to_secid = 0;
++void *ksu_ext_p_security_secid_to_secctx = 0;
++void *ksu_ext_p_set_groups = 0;
++void *ksu_ext_p_static_key_count = 0;
++void *ksu_ext_p_static_key_enable = 0;
++void *ksu_ext_p_tracepoint_srcu = 0;
++
++static void ksu_ext_more_init(void);
++__asm__(
++    ".text\n"
++    ".globl __put_cred\n"
++    ".type __put_cred, %function\n"
++    "__put_cred:\n"
++    "  adrp x16, ksu_ext_p___put_cred\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p___put_cred]\n"
++    "  br x16\n"
++    ".size __put_cred, .-__put_cred\n");
++__asm__(
++    ".text\n"
++    ".globl _copy_to_iter\n"
++    ".type _copy_to_iter, %function\n"
++    "_copy_to_iter:\n"
++    "  adrp x16, ksu_ext_p__copy_to_iter\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p__copy_to_iter]\n"
++    "  br x16\n"
++    ".size _copy_to_iter, .-_copy_to_iter\n");
++__asm__(
++    ".text\n"
++    ".globl abort_creds\n"
++    ".type abort_creds, %function\n"
++    "abort_creds:\n"
++    "  adrp x16, ksu_ext_p_abort_creds\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_abort_creds]\n"
++    "  br x16\n"
++    ".size abort_creds, .-abort_creds\n");
++__asm__(
++    ".text\n"
++    ".globl alloc_file_pseudo\n"
++    ".type alloc_file_pseudo, %function\n"
++    "alloc_file_pseudo:\n"
++    "  adrp x16, ksu_ext_p_alloc_file_pseudo\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_alloc_file_pseudo]\n"
++    "  br x16\n"
++    ".size alloc_file_pseudo, .-alloc_file_pseudo\n");
++__asm__(
++    ".text\n"
++    ".globl bin2hex\n"
++    ".type bin2hex, %function\n"
++    "bin2hex:\n"
++    "  adrp x16, ksu_ext_p_bin2hex\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_bin2hex]\n"
++    "  br x16\n"
++    ".size bin2hex, .-bin2hex\n");
++__asm__(
++    ".text\n"
++    ".globl commit_creds\n"
++    ".type commit_creds, %function\n"
++    "commit_creds:\n"
++    "  adrp x16, ksu_ext_p_commit_creds\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_commit_creds]\n"
++    "  br x16\n"
++    ".size commit_creds, .-commit_creds\n");
++__asm__(
++    ".text\n"
++    ".globl copy_from_user_nofault\n"
++    ".type copy_from_user_nofault, %function\n"
++    "copy_from_user_nofault:\n"
++    "  adrp x16, ksu_ext_p_copy_from_user_nofault\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_copy_from_user_nofault]\n"
++    "  br x16\n"
++    ".size copy_from_user_nofault, .-copy_from_user_nofault\n");
++__asm__(
++    ".text\n"
++    ".globl copy_to_user_nofault\n"
++    ".type copy_to_user_nofault, %function\n"
++    "copy_to_user_nofault:\n"
++    "  adrp x16, ksu_ext_p_copy_to_user_nofault\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_copy_to_user_nofault]\n"
++    "  br x16\n"
++    ".size copy_to_user_nofault, .-copy_to_user_nofault\n");
++__asm__(
++    ".text\n"
++    ".globl dentry_open\n"
++    ".type dentry_open, %function\n"
++    "dentry_open:\n"
++    "  adrp x16, ksu_ext_p_dentry_open\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_dentry_open]\n"
++    "  br x16\n"
++    ".size dentry_open, .-dentry_open\n");
++__asm__(
++    ".text\n"
++    ".globl free_uid\n"
++    ".type free_uid, %function\n"
++    "free_uid:\n"
++    "  adrp x16, ksu_ext_p_free_uid\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_free_uid]\n"
++    "  br x16\n"
++    ".size free_uid, .-free_uid\n");
++__asm__(
++    ".text\n"
++    ".globl fsnotify_add_mark\n"
++    ".type fsnotify_add_mark, %function\n"
++    "fsnotify_add_mark:\n"
++    "  adrp x16, ksu_ext_p_fsnotify_add_mark\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_fsnotify_add_mark]\n"
++    "  br x16\n"
++    ".size fsnotify_add_mark, .-fsnotify_add_mark\n");
++__asm__(
++    ".text\n"
++    ".globl fsnotify_alloc_group\n"
++    ".type fsnotify_alloc_group, %function\n"
++    "fsnotify_alloc_group:\n"
++    "  adrp x16, ksu_ext_p_fsnotify_alloc_group\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_fsnotify_alloc_group]\n"
++    "  br x16\n"
++    ".size fsnotify_alloc_group, .-fsnotify_alloc_group\n");
++__asm__(
++    ".text\n"
++    ".globl fsnotify_destroy_mark\n"
++    ".type fsnotify_destroy_mark, %function\n"
++    "fsnotify_destroy_mark:\n"
++    "  adrp x16, ksu_ext_p_fsnotify_destroy_mark\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_fsnotify_destroy_mark]\n"
++    "  br x16\n"
++    ".size fsnotify_destroy_mark, .-fsnotify_destroy_mark\n");
++__asm__(
++    ".text\n"
++    ".globl fsnotify_init_mark\n"
++    ".type fsnotify_init_mark, %function\n"
++    "fsnotify_init_mark:\n"
++    "  adrp x16, ksu_ext_p_fsnotify_init_mark\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_fsnotify_init_mark]\n"
++    "  br x16\n"
++    ".size fsnotify_init_mark, .-fsnotify_init_mark\n");
++__asm__(
++    ".text\n"
++    ".globl fsnotify_put_group\n"
++    ".type fsnotify_put_group, %function\n"
++    "fsnotify_put_group:\n"
++    "  adrp x16, ksu_ext_p_fsnotify_put_group\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_fsnotify_put_group]\n"
++    "  br x16\n"
++    ".size fsnotify_put_group, .-fsnotify_put_group\n");
++__asm__(
++    ".text\n"
++    ".globl fsnotify_put_mark\n"
++    ".type fsnotify_put_mark, %function\n"
++    "fsnotify_put_mark:\n"
++    "  adrp x16, ksu_ext_p_fsnotify_put_mark\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_fsnotify_put_mark]\n"
++    "  br x16\n"
++    ".size fsnotify_put_mark, .-fsnotify_put_mark\n");
++__asm__(
++    ".text\n"
++    ".globl full_name_hash\n"
++    ".type full_name_hash, %function\n"
++    "full_name_hash:\n"
++    "  adrp x16, ksu_ext_p_full_name_hash\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_full_name_hash]\n"
++    "  br x16\n"
++    ".size full_name_hash, .-full_name_hash\n");
++__asm__(
++    ".text\n"
++    ".globl get_task_cred\n"
++    ".type get_task_cred, %function\n"
++    "get_task_cred:\n"
++    "  adrp x16, ksu_ext_p_get_task_cred\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_get_task_cred]\n"
++    "  br x16\n"
++    ".size get_task_cred, .-get_task_cred\n");
++__asm__(
++    ".text\n"
++    ".globl groups_alloc\n"
++    ".type groups_alloc, %function\n"
++    "groups_alloc:\n"
++    "  adrp x16, ksu_ext_p_groups_alloc\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_groups_alloc]\n"
++    "  br x16\n"
++    ".size groups_alloc, .-groups_alloc\n");
++__asm__(
++    ".text\n"
++    ".globl groups_free\n"
++    ".type groups_free, %function\n"
++    "groups_free:\n"
++    "  adrp x16, ksu_ext_p_groups_free\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_groups_free]\n"
++    "  br x16\n"
++    ".size groups_free, .-groups_free\n");
++__asm__(
++    ".text\n"
++    ".globl groups_sort\n"
++    ".type groups_sort, %function\n"
++    "groups_sort:\n"
++    "  adrp x16, ksu_ext_p_groups_sort\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_groups_sort]\n"
++    "  br x16\n"
++    ".size groups_sort, .-groups_sort\n");
++__asm__(
++    ".text\n"
++    ".globl ihold\n"
++    ".type ihold, %function\n"
++    "ihold:\n"
++    "  adrp x16, ksu_ext_p_ihold\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_ihold]\n"
++    "  br x16\n"
++    ".size ihold, .-ihold\n");
++__asm__(
++    ".text\n"
++    ".globl iterate_dir\n"
++    ".type iterate_dir, %function\n"
++    "iterate_dir:\n"
++    "  adrp x16, ksu_ext_p_iterate_dir\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_iterate_dir]\n"
++    "  br x16\n"
++    ".size iterate_dir, .-iterate_dir\n");
++__asm__(
++    ".text\n"
++    ".globl override_creds\n"
++    ".type override_creds, %function\n"
++    "override_creds:\n"
++    "  adrp x16, ksu_ext_p_override_creds\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_override_creds]\n"
++    "  br x16\n"
++    ".size override_creds, .-override_creds\n");
++__asm__(
++    ".text\n"
++    ".globl path_get\n"
++    ".type path_get, %function\n"
++    "path_get:\n"
++    "  adrp x16, ksu_ext_p_path_get\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_path_get]\n"
++    "  br x16\n"
++    ".size path_get, .-path_get\n");
++__asm__(
++    ".text\n"
++    ".globl prepare_creds\n"
++    ".type prepare_creds, %function\n"
++    "prepare_creds:\n"
++    "  adrp x16, ksu_ext_p_prepare_creds\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_prepare_creds]\n"
++    "  br x16\n"
++    ".size prepare_creds, .-prepare_creds\n");
++__asm__(
++    ".text\n"
++    ".globl revert_creds\n"
++    ".type revert_creds, %function\n"
++    "revert_creds:\n"
++    "  adrp x16, ksu_ext_p_revert_creds\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_revert_creds]\n"
++    "  br x16\n"
++    ".size revert_creds, .-revert_creds\n");
++__asm__(
++    ".text\n"
++    ".globl security_release_secctx\n"
++    ".type security_release_secctx, %function\n"
++    "security_release_secctx:\n"
++    "  adrp x16, ksu_ext_p_security_release_secctx\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_security_release_secctx]\n"
++    "  br x16\n"
++    ".size security_release_secctx, .-security_release_secctx\n");
++__asm__(
++    ".text\n"
++    ".globl security_secctx_to_secid\n"
++    ".type security_secctx_to_secid, %function\n"
++    "security_secctx_to_secid:\n"
++    "  adrp x16, ksu_ext_p_security_secctx_to_secid\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_security_secctx_to_secid]\n"
++    "  br x16\n"
++    ".size security_secctx_to_secid, .-security_secctx_to_secid\n");
++__asm__(
++    ".text\n"
++    ".globl security_secid_to_secctx\n"
++    ".type security_secid_to_secctx, %function\n"
++    "security_secid_to_secctx:\n"
++    "  adrp x16, ksu_ext_p_security_secid_to_secctx\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_security_secid_to_secctx]\n"
++    "  br x16\n"
++    ".size security_secid_to_secctx, .-security_secid_to_secctx\n");
++__asm__(
++    ".text\n"
++    ".globl set_groups\n"
++    ".type set_groups, %function\n"
++    "set_groups:\n"
++    "  adrp x16, ksu_ext_p_set_groups\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_set_groups]\n"
++    "  br x16\n"
++    ".size set_groups, .-set_groups\n");
++__asm__(
++    ".text\n"
++    ".globl static_key_count\n"
++    ".type static_key_count, %function\n"
++    "static_key_count:\n"
++    "  adrp x16, ksu_ext_p_static_key_count\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_static_key_count]\n"
++    "  br x16\n"
++    ".size static_key_count, .-static_key_count\n");
++__asm__(
++    ".text\n"
++    ".globl static_key_enable\n"
++    ".type static_key_enable, %function\n"
++    "static_key_enable:\n"
++    "  adrp x16, ksu_ext_p_static_key_enable\n"
++    "  ldr x16, [x16, #:lo12:ksu_ext_p_static_key_enable]\n"
++    "  br x16\n"
++    ".size static_key_enable, .-static_key_enable\n");
++__asm__(
++    ".bss\n"
++    ".globl init_pid_ns\n"
++    ".align 3\n"
++    "init_pid_ns:\n"
++    "  .space 256\n");
++__asm__(
++    ".bss\n"
++    ".globl tracepoint_srcu\n"
++    ".align 3\n"
++    "tracepoint_srcu:\n"
++    "  .space 256\n");
++/* init_pid_ns is typed by kernel headers; tracepoint_srcu is not declared in
++ * any header this file pulls in, so give it a storage-only declaration. */
++extern char tracepoint_srcu[];
++
++static void ksu_ext_more_init(void)
++{
++    ksu_ext_p___put_cred = ksu_ext_resolve("__put_cred");
++    ksu_ext_p__copy_to_iter = ksu_ext_resolve("_copy_to_iter");
++    ksu_ext_p_abort_creds = ksu_ext_resolve("abort_creds");
++    ksu_ext_p_alloc_file_pseudo = ksu_ext_resolve("alloc_file_pseudo");
++    ksu_ext_p_bin2hex = ksu_ext_resolve("bin2hex");
++    ksu_ext_p_commit_creds = ksu_ext_resolve("commit_creds");
++    ksu_ext_p_copy_from_user_nofault = ksu_ext_resolve("copy_from_user_nofault");
++    ksu_ext_p_copy_to_user_nofault = ksu_ext_resolve("copy_to_user_nofault");
++    ksu_ext_p_dentry_open = ksu_ext_resolve("dentry_open");
++    ksu_ext_p_free_uid = ksu_ext_resolve("free_uid");
++    ksu_ext_p_fsnotify_add_mark = ksu_ext_resolve("fsnotify_add_mark");
++    ksu_ext_p_fsnotify_alloc_group = ksu_ext_resolve("fsnotify_alloc_group");
++    ksu_ext_p_fsnotify_destroy_mark = ksu_ext_resolve("fsnotify_destroy_mark");
++    ksu_ext_p_fsnotify_init_mark = ksu_ext_resolve("fsnotify_init_mark");
++    ksu_ext_p_fsnotify_put_group = ksu_ext_resolve("fsnotify_put_group");
++    ksu_ext_p_fsnotify_put_mark = ksu_ext_resolve("fsnotify_put_mark");
++    ksu_ext_p_full_name_hash = ksu_ext_resolve("full_name_hash");
++    ksu_ext_p_get_task_cred = ksu_ext_resolve("get_task_cred");
++    ksu_ext_p_groups_alloc = ksu_ext_resolve("groups_alloc");
++    ksu_ext_p_groups_free = ksu_ext_resolve("groups_free");
++    ksu_ext_p_groups_sort = ksu_ext_resolve("groups_sort");
++    ksu_ext_p_ihold = ksu_ext_resolve("ihold");
++    ksu_ext_p_init_pid_ns = ksu_ext_resolve("init_pid_ns");
++    ksu_ext_p_iterate_dir = ksu_ext_resolve("iterate_dir");
++    ksu_ext_p_override_creds = ksu_ext_resolve("override_creds");
++    ksu_ext_p_path_get = ksu_ext_resolve("path_get");
++    ksu_ext_p_prepare_creds = ksu_ext_resolve("prepare_creds");
++    ksu_ext_p_revert_creds = ksu_ext_resolve("revert_creds");
++    ksu_ext_p_security_release_secctx = ksu_ext_resolve("security_release_secctx");
++    ksu_ext_p_security_secctx_to_secid = ksu_ext_resolve("security_secctx_to_secid");
++    ksu_ext_p_security_secid_to_secctx = ksu_ext_resolve("security_secid_to_secctx");
++    ksu_ext_p_set_groups = ksu_ext_resolve("set_groups");
++    ksu_ext_p_static_key_count = ksu_ext_resolve("static_key_count");
++    ksu_ext_p_static_key_enable = ksu_ext_resolve("static_key_enable");
++    ksu_ext_p_tracepoint_srcu = ksu_ext_resolve("tracepoint_srcu");
++    if (ksu_ext_p_init_pid_ns) memcpy((void *)&init_pid_ns, ksu_ext_p_init_pid_ns, 256);
++    if (ksu_ext_p_tracepoint_srcu) memcpy(tracepoint_srcu, ksu_ext_p_tracepoint_srcu, 256);
++}
++
++/* Kernel-side breadcrumb logger. A hard reset drops both the dmesg ring and
++ * every unsynced page, so in-kernel prints are unobservable exactly when we
++ * need them. This writes a line and fsyncs it before returning. */
++void ksu_bc(const char *msg)
++{
++    struct file *f;
++    loff_t pos = 0;
++
++    if (!ksu_ext_p_filp_open || !ksu_ext_p_kernel_write)
++        return;
++    f = filp_open("/data/local/tmp/bc.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
++    if (IS_ERR(f) || !f)
++        return;
++    kernel_write(f, msg, strlen(msg), &pos);
++    vfs_fsync(f, 0);
++    filp_close(f, NULL);
++}
++
++/* ksu_ext_tramp_added: direct calls into these stubs reach the kernel
++ * function through br x16, so the compiler never instruments them with a
++ * CFI type check. Calling through a C function pointer emits
++ * __cfi_slowpath, and Honor HISEC resets the device when that fails. */
++__asm__(
++    ".text\n"
++    ".global filp_open\n"
++    ".type filp_open, %function\n"
++    "filp_open:\n"
++    "adrp x16, ksu_ext_p_filp_open\n"
++    "ldr x16, [x16, #:lo12:ksu_ext_p_filp_open]\n"
++    "br x16\n"
++    ".size filp_open, . - filp_open\n"
++);
++__asm__(
++    ".text\n"
++    ".global kernel_write\n"
++    ".type kernel_write, %function\n"
++    "kernel_write:\n"
++    "adrp x16, ksu_ext_p_kernel_write\n"
++    "ldr x16, [x16, #:lo12:ksu_ext_p_kernel_write]\n"
++    "br x16\n"
++    ".size kernel_write, . - kernel_write\n"
++);
++__asm__(
++    ".text\n"
++    ".global set_memory_rw\n"
++    ".type set_memory_rw, %function\n"
++    "set_memory_rw:\n"
++    "adrp x16, ksu_ext_p_set_memory_rw\n"
++    "ldr x16, [x16, #:lo12:ksu_ext_p_set_memory_rw]\n"
++    "br x16\n"
++    ".size set_memory_rw, . - set_memory_rw\n"
++);
++__asm__(
++    ".text\n"
++    ".global set_memory_ro\n"
++    ".type set_memory_ro, %function\n"
++    "set_memory_ro:\n"
++    "adrp x16, ksu_ext_p_set_memory_ro\n"
++    "ldr x16, [x16, #:lo12:ksu_ext_p_set_memory_ro]\n"
++    "br x16\n"
++    ".size set_memory_ro, . - set_memory_ro\n"
++);
+diff -ruN --strip-trailing-cr a/kernel/infra/file_wrapper.c b/kernel/infra/file_wrapper.c
+--- a/kernel/infra/file_wrapper.c	2026-11-12 10:30:25.774297400 +0800
++++ b/kernel/infra/file_wrapper.c	2026-11-12 10:30:25.901446200 +0800
+@@ -19,6 +19,7 @@
+ #include "selinux/selinux.h"
+ 
+ #include "infra/file_wrapper.h"
++#include "ext_fns.h"
+ 
+ struct ksu_file_wrapper {
+     struct file *orig;
+diff -ruN --strip-trailing-cr a/kernel/infra/su_mount_ns.c b/kernel/infra/su_mount_ns.c
+--- a/kernel/infra/su_mount_ns.c	2026-11-12 10:30:25.776297400 +0800
++++ b/kernel/infra/su_mount_ns.c	2026-11-12 10:30:25.906505100 +0800
+@@ -30,6 +30,8 @@
+ extern long __x64_sys_setns(const struct pt_regs *regs);
+ #endif
+ 
++#include "ext_fns.h"
++
+ static long ksu_sys_setns(int fd, int flags)
+ {
+     struct pt_regs regs;
+diff -ruN --strip-trailing-cr a/kernel/infra/symbol_resolver.c b/kernel/infra/symbol_resolver.c
+--- a/kernel/infra/symbol_resolver.c	2026-11-12 10:30:25.775297400 +0800
++++ b/kernel/infra/symbol_resolver.c	2026-11-12 10:30:25.907523700 +0800
+@@ -4,6 +4,7 @@
+ #include <linux/version.h>
+ 
+ #include "infra/symbol_resolver.h"
++#include "ext_fns.h"
+ 
+ // https://github.com/torvalds/linux/commit/89245600941e4e0f87d77f60ee269b5e61ef4e49
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+@@ -67,12 +68,14 @@
+     char buf[KSYM_SYMBOL_LEN];
+ 
+     addr = kallsyms_lookup_name(symbol_name);
+-    // check if it is kernel symbol
+-    kallsyms_lookup(addr, NULL, NULL, &module_name, buf);
+-    if (unlikely(module_name)) {
+-        pr_warn("ignore symbol %s of module %s\n", symbol_name, module_name);
+-        return 0;
+-    }
++    /* The original code called kallsyms_lookup() here to reject symbols that
++     * belong to another module. That symbol is not EXPORT_SYMBOL'd on this
++     * Honor kernel and is served by one of our trampolines, and that call path
++     * faults (verified by bisection). The module-name check is only a
++     * hardening measure for the resolver, so drop it: a kernel address is
++     * returned as-is. */
++    (void)module_name;
++    (void)buf;
+     return addr;
+ }
+ 
+@@ -174,16 +177,5 @@
+ 
+ void __init ksu_init_symbol_resolver()
+ {
+-#if !ALWAYS_HAVE_ON_EACH_SYMBOL
+-    kallsyms_on_each_symbol_fn = find_kernel_symbol_exact("kallsyms_on_each_symbol");
+-    if (!kallsyms_on_each_symbol_fn) {
+-        pr_warn("kallsyms_on_each_symbol not found!\n");
+-    }
+-#endif
+-#if HAVE_ON_EACH_MATCH_SYMBOL
+-    kallsyms_on_each_match_symbol_fn = find_kernel_symbol_exact("kallsyms_on_each_match_symbol");
+-    if (!kallsyms_on_each_match_symbol_fn) {
+-        pr_warn("kallsyms_on_each_match_symbol not found!\n");
+-    }
+-#endif
++    pr_info("KSUBC: resolver noop\n");
+ }
+diff -ruN --strip-trailing-cr a/kernel/policy/allowlist.c b/kernel/policy/allowlist.c
+--- a/kernel/policy/allowlist.c	2026-11-12 10:30:25.803090000 +0800
++++ b/kernel/policy/allowlist.c	2026-11-12 10:30:25.918037600 +0800
+@@ -25,6 +25,7 @@
+ #include "policy/allowlist.h"
+ #include "manager/manager_identity.h"
+ #include "infra/su_mount_ns.h"
++#include "ext_fns.h"
+ 
+ #define FILE_MAGIC 0x7f4b5355 // ' KSU', u32
+ #define FILE_FORMAT_VERSION 4 // u32
+diff -ruN --strip-trailing-cr a/kernel/policy/app_profile.c b/kernel/policy/app_profile.c
+--- a/kernel/policy/app_profile.c	2026-11-12 10:30:25.803589700 +0800
++++ b/kernel/policy/app_profile.c	2026-11-12 10:30:25.920265200 +0800
+@@ -65,6 +65,7 @@
+ }
+ 
+ void seccomp_filter_release(struct task_struct *tsk);
++#include "ext_fns.h"
+ 
+ // https://cs.android.com/android/_/android/kernel/common/+/5346453405bf12d7ed6003f45dd47b71744fe1be
+ // Some 15-6.6 kernel have this backport while others don't have, e.g. Pixel 10
+diff -ruN --strip-trailing-cr a/kernel/runtime/boot_event.c b/kernel/runtime/boot_event.c
+--- a/kernel/runtime/boot_event.c	2026-11-12 10:30:25.819021700 +0800
++++ b/kernel/runtime/boot_event.c	2026-11-12 10:30:25.923859300 +0800
+@@ -34,6 +34,7 @@
+ }
+ 
+ extern void ext4_unregister_sysfs(struct super_block *sb);
++#include "ext_fns.h"
+ 
+ int nuke_ext4_sysfs(const char *mnt)
+ {
+diff -ruN --strip-trailing-cr a/kernel/runtime/ksud_integration.c b/kernel/runtime/ksud_integration.c
+--- a/kernel/runtime/ksud_integration.c	2026-11-12 10:30:25.819021700 +0800
++++ b/kernel/runtime/ksud_integration.c	2026-11-12 10:30:25.926088200 +0800
+@@ -28,6 +28,7 @@
+ #include "selinux/selinux.h"
+ #include "hook/syscall_hook.h"
+ #include "hook/syscall_event_bridge.h"
++#include "ext_fns.h"
+ 
+ // clang-format off
+ static const char KERNEL_SU_RC[] =
+diff -ruN --strip-trailing-cr a/kernel/selinux/rules.c b/kernel/selinux/rules.c
+--- a/kernel/selinux/rules.c	2026-11-12 10:30:25.738985100 +0800
++++ b/kernel/selinux/rules.c	2026-11-12 10:30:25.931667400 +0800
+@@ -5,6 +5,9 @@
+ #include <linux/version.h>
+ #include <linux/lockdep.h>
+ #include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/vmalloc.h>
++#include <linux/kernel_read_file.h>
+ #include <linux/string.h>
+ 
+ #include "uapi/selinux.h"
+@@ -16,6 +19,78 @@
+ #include "xfrm.h"
+ 
+ struct selinux_policy *backup_sepolicy;
++int ksu_install_backup_sepolicy(const char *path)
++{
++    struct selinux_policy *pol;
++    struct policy_file fp = {};
++    struct file *f;
++    loff_t size, pos = 0;
++    char *data;
++    int ret;
++
++    f = filp_open(path, O_RDONLY, 0);
++    if (IS_ERR(f))
++        return PTR_ERR(f);
++
++    size = i_size_read(file_inode(f));
++    if (size <= 0 || size > SZ_64M) {
++        filp_close(f, NULL);
++        return -EINVAL;
++    }
++
++    data = vmalloc(size);
++    if (!data) {
++        filp_close(f, NULL);
++        return -ENOMEM;
++    }
++
++    ret = kernel_read(f, data, size, &pos);
++    filp_close(f, NULL);
++    if (ret != size) {
++        ret = ret < 0 ? ret : -EIO;
++        goto out_free;
++    }
++
++    pol = kzalloc(sizeof(*pol), GFP_KERNEL);
++    if (!pol) {
++        ret = -ENOMEM;
++        goto out_free;
++    }
++
++    fp.data = data;
++    fp.len = size;
++    ret = policydb_read(&pol->policydb, &fp);
++    if (ret)
++        goto out_free_pol;
++    pol->policydb.len = size;
++
++    pol->sidtab = kzalloc(sizeof(*pol->sidtab), GFP_KERNEL);
++    if (!pol->sidtab) {
++        ret = -ENOMEM;
++        goto out_free_db;
++    }
++
++    ret = policydb_load_isids(&pol->policydb, pol->sidtab);
++    if (ret)
++        goto out_free_sidtab;
++
++    backup_sepolicy = pol;
++    pr_info("backup sepolicy installed from %s (len=%lld)\n", path, size);
++    vfree(data);
++    return 0;
++
++out_free_sidtab:
++    kfree(pol->sidtab);
++out_free_db:
++    policydb_destroy(&pol->policydb);
++out_free_pol:
++    kfree(pol);
++out_free:
++    vfree(data);
++    pr_err("install backup sepolicy failed: %d\n", ret);
++    return ret;
++}
++
+ 
+ #define SELINUX_POLICY_INSTEAD_SELINUX_SS
+ 
+@@ -25,6 +100,7 @@
+ extern int avc_ss_reset(u32 seqno);
+ #else
+ extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
++#include "ext_fns.h"
+ #endif
+ // reset avc cache table, otherwise the new rules will not take effect if already denied
+ static void reset_avc_cache()
+diff -ruN --strip-trailing-cr a/kernel/selinux/selinux.c b/kernel/selinux/selinux.c
+--- a/kernel/selinux/selinux.c	2026-11-12 10:30:25.739984500 +0800
++++ b/kernel/selinux/selinux.c	2026-11-12 10:30:25.927092300 +0800
+@@ -5,6 +5,7 @@
+ #include "linux/version.h"
+ #include "klog.h" // IWYU pragma: keep
+ #include "ksu.h"
++#include "ext_fns.h"
+ 
+ /*
+  * Cached SID values for frequently checked contexts.
+diff -ruN --strip-trailing-cr a/kernel/selinux/sepolicy.c b/kernel/selinux/sepolicy.c
+--- a/kernel/selinux/sepolicy.c	2026-11-12 10:30:25.740994600 +0800
++++ b/kernel/selinux/sepolicy.c	2026-11-12 10:30:25.933125200 +0800
+@@ -13,6 +13,7 @@
+ #include "sepolicy.h"
+ #include "klog.h" // IWYU pragma: keep
+ #include "ss/symtab.h"
++#include "ext_fns.h"
+ 
+ #define KSU_SUPPORT_ADD_TYPE
+ 
+@@ -904,12 +905,23 @@
+ {
+     int ret;
+     size_t len;
++    size_t alloc_len, used;
+     struct selinux_policy *new_pol;
+     void *data;
+     struct policy_file fp;
+ 
+     len = old_pol->policydb.len;
+-    data = vmalloc(len);
++    // policydb.len is the blob size as of the last policy LOAD. Rules
++    // injected since then grow the serialized image past it, and
++    // policydb_write() fails with -EINVAL once put_entry() crosses
++    // fp->len (policydb.h). Over-allocate so a policy already grown by
++    // previous injections still serializes, and remember the TRUE size
++    // so the copy carries a fresh policydb.len. Without this, every
++    // dynamic rule application after the first dies here, and
++    // /sys/fs/selinux/policy reads break the same way (they size their
++    // buffer by policydb.len too).
++    alloc_len = len + (1 << 20);
++    data = vmalloc(alloc_len);
+     if (!data) {
+         pr_err("alloc policy len %ld\n", len);
+         ret = -ENOMEM;
+@@ -917,13 +929,14 @@
+     }
+ 
+     fp.data = data;
+-    fp.len = len;
++    fp.len = alloc_len;
+ 
+     ret = policydb_write(&old_pol->policydb, &fp);
+     if (ret) {
+         pr_err("sepolicy: policydb_write: %d\n", ret);
+         goto out_free_data;
+     }
++    used = alloc_len - fp.len; // put_entry() decremented fp.len by the bytes written
+     // https://android.googlesource.com/kernel/common/+/35a7845718734ae638b85b420534cb859498dab6%5E%21
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+     // https://android-review.googlesource.com/c/kernel/common/+/3009995/11/security/selinux/ss/policydb.c
+@@ -954,14 +967,14 @@
+ 
+     // rewind fp
+     fp.data = data;
+-    fp.len = len;
++    fp.len = used;
+ 
+     ret = policydb_read(&new_pol->policydb, &fp);
+     if (ret) {
+         pr_err("sepolicy: policydb_read: %d\n", ret);
+         goto out_free_policydb;
+     }
+-    new_pol->policydb.len = old_pol->policydb.len;
++    new_pol->policydb.len = used;
+     kvfree(data);
+ 
+     return new_pol;
+diff -ruN --strip-trailing-cr a/kernel/sulog/event.c b/kernel/sulog/event.c
+--- a/kernel/sulog/event.c	2026-11-12 10:30:25.816014200 +0800
++++ b/kernel/sulog/event.c	2026-11-12 10:30:25.935502300 +0800
+@@ -18,6 +18,7 @@
+ #include "infra/event_queue.h"
+ #include "klog.h" // IWYU pragma: keep
+ #include "sulog/event.h"
++#include "ext_fns.h"
+ 
+ #define KSU_SULOG_MAX_QUEUED 256U
+ #define KSU_SULOG_MAX_PAYLOAD_LEN 2048U
+diff -ruN --strip-trailing-cr a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+--- a/kernel/supercall/dispatch.c	2026-11-12 10:30:25.805034300 +0800
++++ b/kernel/supercall/dispatch.c	2026-11-12 10:30:25.939537400 +0800
+@@ -21,6 +21,7 @@
+ #include "sulog/event.h"
+ #include "sulog/fd.h"
+ #include "supercall/supercall.h"
++#include "ext_fns.h"
+ 
+ static int do_grant_root(void __user *arg)
+ {
+@@ -57,6 +58,7 @@
+     cmd.features = KSU_FEATURE_MAX;
+     cmd.uapi_version = KERNEL_SU_UAPI_VERSION;
+ 
++    pr_info("KSUBC: sc10 before copy size=%zu arg=%px\n", sizeof(cmd), arg);
+     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+         pr_err("get_version: copy_to_user failed\n");
+         return -EFAULT;
+@@ -339,7 +341,17 @@
+     profile = ksu_get_app_profile(uid);
+     rcu_read_unlock();
+     if (!profile) {
+-        ret = -ENOENT;
++        /* The per-app profile subsystem is not initialised on this port (its
++         * init stage resets the device), so report a default zeroed profile
++         * instead of -ENOENT; the Manager treats ENOENT as "not installed". */
++        struct app_profile def;
++
++        memset(&def, 0, sizeof(def));
++        if (copy_to_user((char __user *)arg + offsetof(struct ksu_get_app_profile_cmd, profile),
++                         &def, sizeof(def)))
++            ret = -EFAULT;
++        else
++            ret = 0;
+     } else {
+         if (copy_to_user((char __user *)arg + offsetof(struct ksu_get_app_profile_cmd, profile), profile,
+                          sizeof(struct app_profile))) {
+@@ -695,7 +707,7 @@
+         .cmd = KSU_IOCTL_GRANT_ROOT,
+         .name = "GRANT_ROOT",
+         .handler = do_grant_root,
+-        .perm_check = allowed_for_su 
++        .perm_check = always_allow  /* no allowlist on this port */
+     },
+     {
+         .cmd = KSU_IOCTL_GET_INFO,
+@@ -848,19 +860,26 @@
+ {
+     int i;
+ 
++    pr_info("KSUBC: sc8 ioctl entered cmd=0x%x\n", cmd);
++
+ #ifdef CONFIG_KSU_DEBUG
+     pr_info("ksu ioctl: cmd=0x%x from uid=%d\n", cmd, current_uid().val);
+ #endif
+ 
+     for (i = 0; ksu_ioctl_handlers[i].handler; i++) {
+         if (cmd == ksu_ioctl_handlers[i].cmd) {
++            pr_info("KSUBC: sc9 dispatch idx=%d perm_check=%d\n", i,
++                    ksu_ioctl_handlers[i].perm_check != NULL);
+             // Check permission first
+             if (ksu_ioctl_handlers[i].perm_check && !ksu_ioctl_handlers[i].perm_check()) {
+                 pr_warn("ksu ioctl: permission denied for cmd=0x%x uid=%d\n", cmd, current_uid().val);
+                 return -EPERM;
+             }
+             // Execute handler
+-            return ksu_ioctl_handlers[i].handler(argp);
++            pr_info("KSUBC: sc9 calling handler idx=%d\n", i);
++            long r = ksu_ioctl_handlers[i].handler(argp);
++            pr_info("KSUBC: sc9 handler returned %ld\n", r);
++            return r;
+         }
+     }
+ 
+diff -ruN --strip-trailing-cr a/kernel/supercall/supercall.c b/kernel/supercall/supercall.c
+--- a/kernel/supercall/supercall.c	2026-11-12 10:30:25.806041500 +0800
++++ b/kernel/supercall/supercall.c	2026-11-12 10:30:25.940705200 +0800
+@@ -16,6 +16,7 @@
+ #include "arch.h"
+ #include "util.h"
+ #include "klog.h" // IWYU pragma: keep
++#include "ext_fns.h"
+ 
+ struct ksu_install_fd_tw {
+     struct callback_head cb;
+@@ -45,7 +46,9 @@
+     struct file *filp;
+     int fd;
+ 
++    pr_info("KSUBC: install_fd enter\n");
+     fd = get_unused_fd_flags(O_CLOEXEC);
++    pr_info("KSUBC: install_fd fd=%d\n", fd);
+     if (fd < 0) {
+         pr_err("ksu_install_fd: failed to get unused fd\n");
+         return fd;
+@@ -58,21 +61,27 @@
+         return PTR_ERR(filp);
+     }
+ 
++    pr_info("KSUBC: install_fd got file, calling fd_install\n");
+     fd_install(fd, filp);
+-    pr_info("ksu fd installed: %d for pid %d\n", fd, current->pid);
++    pr_info("KSUBC: ksu fd installed: %d for pid %d\n", fd, current->pid);
+     return fd;
+ }
+ 
++static void ksu_bisect_noop_cb(struct callback_head *cb)
++{
++    struct ksu_install_fd_tw *tw = container_of(cb, struct ksu_install_fd_tw, cb);
++    pr_info("KSUBC: sc3 task_work ran\n");
++    kfree(tw);
++}
++
+ static void ksu_install_fd_tw_func(struct callback_head *cb)
+ {
+     struct ksu_install_fd_tw *tw = container_of(cb, struct ksu_install_fd_tw, cb);
+     int fd = ksu_install_fd();
+ 
+-    pr_info("[%d] install ksu fd: %d\n", current->pid, fd);
+-    if (copy_to_user(tw->outp, &fd, sizeof(fd))) {
+-        pr_err("install ksu fd reply err\n");
+-        ksu_close_fd(fd);
+-    }
++    pr_info("KSUBC: sc7 fd=%d outp=%px\n", fd, tw->outp);
++    if (copy_to_user_nofault(tw->outp, &fd, sizeof(fd)))
++        pr_err("KSUBC: sc7 nofault copy failed\n");
+ 
+     kfree(tw);
+ }
+@@ -83,6 +92,7 @@
+     int magic1 = (int)PT_REGS_PARM1(real_regs);
+     int magic2 = (int)PT_REGS_PARM2(real_regs);
+ 
++    pr_info("KSUBC: reboot_kp magic=%d,%d\n", magic1, magic2);
+     if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_INSTALL_MAGIC2) {
+         struct ksu_install_fd_tw *tw;
+         unsigned long arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(real_regs);

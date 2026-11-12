@@ -72,6 +72,35 @@ NOT CHANGED  exploit/src/*.c, exploit/src/*.h — the exploit core.
 Not hardware-tested. Firmware version strings could not be verified from inside
 the boot images: neither dump contains build.prop, MagicOS, or ALI-* strings.
 
+CHANGED  exploit/src/sysctl.c
+       Added a SYSCTL_VERIFY_ONLY pre-flight gate before the cred write. When
+       set, the chain stops after the VERIFY stage and reports the measured
+       mm->owner / task->comm offsets. Used to prove the profile is correct on a
+       device without risking a misdirected cred write.
+
+CHANGED  exploit/src/util.c
+       prepare_dm_page(): pages whose perf-oracle physical alias falls outside
+       the direct map (observed ~0xc00000000 on this SoC) are now retired
+       immediately instead of being silently skipped, and the candidate budget
+       went from 16 to 32 rounds. On the X50 the old behaviour burned the whole
+       attempt budget on a reading that never changes for that page; this is
+       what made runs after the first minute of boot fail consistently.
+
+ADDED    port/                             KernelSU LKM port for 5.10.236
+         port/kernelsu-3.3.0-honor-5.10.226.patch
+                                          changes to KernelSU v3.3.0 required to
+                                          load and run on this vendor kernel
+         port/build.sh, port/fix-versions.py
+                                          external-module build + __versions fix
+         port/device/, port/host/, port/tools/
+                                          loader, recovery and grant tooling
+         port/tools/gen-allowlist.c       writes /data/adb/ksu/.allowlist
+
+ADDED    docs/LKM-PORT.md                 why the port looks the way it does:
+                                          CFI vs function-pointer shims, .cfi_jt
+                                          ni-syscall thunks, the tracepoint copy
+                                          trap, deferred throne scan, allowlist
+
 --------------------------------------------------------------------------------
 CVE-2026-43499 ("GhostLock")
 --------------------------------------------------------------------------------

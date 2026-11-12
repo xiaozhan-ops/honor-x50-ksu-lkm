@@ -13,3 +13,11 @@ ksu/tools/kernelsu.ko
 # ---- local extraction artifacts (boot images / kernel Image / kallsyms) ----
 tools/bootimg/
 *.img
+
+# ---- port build outputs and local state ----
+port/out/
+*.ko
+gen-allowlist
+gen-allowlist.exe
+allowlist.bin
+allowed_uids.txt

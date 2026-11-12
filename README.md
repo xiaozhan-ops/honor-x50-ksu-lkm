@@ -8,6 +8,32 @@ plus a companion KernelSU kernel-module loading solution.
 Kernel-address offsets in both target profiles were measured from **this
 device's own boot images** rather than copied from another model.
 
+## KernelSU port
+
+The escalation above is the enabling half. The other half is a KernelSU LKM port
+that turns a one-shot uid 0 into something usable: `su` from any authorised app,
+a Manager that talks to the kernel, and per-app authorisation.
+
+It lives in [`port/`](port/) with the engineering write-up in
+[docs/LKM-PORT.md](docs/LKM-PORT.md). The parts worth reading even if you never
+run it:
+
+* 91 kernel symbols resolved at runtime through naked asm trampolines. The
+  obvious C function-pointer macro compiles fine, passes every test you can run
+  without hardware, and **hard-resets the device**: compiler-generated indirect
+  calls carry CFI type hashes, and Honor's HISEC treats a mismatch as an attack.
+* `sys_call_table` on this kernel points at `.cfi_jt` thunks, not at
+  `__arm64_sys_ni_syscall`, so the usual "find a free slot" scan finds nothing.
+* Registering the `sys_enter` tracepoint against a local copy of the struct
+  succeeds, returns 0, and never fires. The hook has to go on the real symbol.
+* `track_throne()` resets the device from module init and is fine from a
+  workqueue.
+
+Root is still **per boot**: the cred swap and the module both live in RAM.
+`port/host/restore.ps1` re-runs the chain, and has to start within about a minute
+of boot.
+
+
 ## Targets
 
 | Profile | Device | Firmware | Kernel |
