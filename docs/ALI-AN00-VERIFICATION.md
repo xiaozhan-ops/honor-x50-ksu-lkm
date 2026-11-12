@@ -131,8 +131,8 @@ the template. That was wrong for this device, for two reasons:
    The shipped `payload/` in this project is a KernelSU-based build, so the
    GhostLock route is also the one that matches the artifact we actually have.
 
-The abandoned IonStack scaffold is left at
-`E:/Projects/honor-x50-cve-2026-43499` for reference. Nothing from it is used here.
+The abandoned IonStack scaffold was left out of this repository. Nothing from
+it is used here.
 
 ## Build status
 

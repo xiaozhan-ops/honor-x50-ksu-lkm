@@ -51,8 +51,10 @@ export. The port resolves them at runtime by name (`kallsyms_lookup_name`) into
   ldr  x16, [x16, #:lo12:ksu_ext_p_<name>]
   br   x16
   ```
-* **4 data slots** — 256-byte local copies (e.g. `selinux_blob_sizes`,
-  `__tracepoint_sys_enter`; the latter is covered in §4).
+* **8 data slots** — the pointer holds the real symbol address. Four of them
+  also get a 256-byte snapshot copied at init, and those snapshots are vestigial:
+  nothing reads them any more. `__tracepoint_sys_enter` is one of the eight, and
+  §4 explains why the snapshot must never be what the kernel sees.
 
 ### The trap: C function-pointer macros trigger CFI
 
@@ -132,6 +134,9 @@ tracepoint_probe_register_prio(
     ksu_sys_enter_handler, NULL, INT_MIN);
 ```
 
+The 256-byte snapshot of the struct is still taken at init, but nothing
+registers against it any more; it is dead weight from the first attempt.
+
 Rule of thumb from this port: **data that the kernel itself dereferences must
 never be a local copy.** A copy is only safe for data the module reads itself.
 
@@ -180,13 +185,16 @@ not doing any useful work.
 ### 6.2 `KSU_VERSION` defaults to 16
 
 `kernel/Kbuild` derives the version from `git describe`. Without a `.git`
-directory it falls back to `-DKSU_VERSION=16`, and the Manager (v3.3.1, version
-32680) then reports the kernel as out of date and enters a limited UI. Pin it
-explicitly:
+directory it falls back to `-DKSU_VERSION=16`, and the Manager (v3.3.1, build
+32680) then reports the module as **not installed**. Pin it explicitly:
 
 ```
 ccflags-y += -DKSU_VERSION=33001
 ```
+
+After this the Manager shows `33001-2` and the status flips to working. The
+"kernel update" banner it keeps displaying was not chased down; the uapi version
+(this port reports 2) is the most likely remaining mismatch.
 
 ### 6.3 Allowlist entries need a non-empty `selinux_domain`
 
@@ -256,8 +264,9 @@ port/build.sh
 python3 port/fix-versions.py out/kernelsu.ko
 ```
 
-The module must be built with `LLVM=1 LLVM_IAS=1`: a different toolchain changes
-the CFI type hashes and HISEC resets the device on load.
+The module was only ever built with `LLVM=1 LLVM_IAS=1`. The module carries CFI
+type hashes, so a different toolchain would produce different ones; another
+toolchain is untested, and a CFI mismatch is what HISEC resets the device on.
 
 ---
 
@@ -267,9 +276,10 @@ the CFI type hashes and HISEC resets the device on load.
   hand; a reboot undoes all of it. `port/host/restore.ps1` re-runs the chain,
   and it must start within ~1 minute of boot.
 * **`su` lands in `u:r:shell:s0`** (no domain transition, §6.4).
-* **No Manager Superuser UI.** The Manager reports the kernel as outdated, so
-  per-app grants go through `port/host/grant.ps1` and take effect on the next
-  module load.
+* **The Manager still shows a "kernel update" banner** even while reporting the
+  module as working. Cause not confirmed; the uapi version (2 here) is the
+  likely mismatch. Because the UI stays in that limited state, per-app grants go
+  through `port/host/grant.ps1` and take effect on the next module load.
 * **No module loading/unloading at runtime.** While any app holds the driver fd,
   the module refcount is non-zero and `rmmod` fails; a new build needs a reboot.
 * **Offsets were measured, not read from source.** Anything marked

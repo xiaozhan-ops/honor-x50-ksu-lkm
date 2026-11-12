@@ -142,7 +142,7 @@ Licensing summary (this repository mixes two licences)
 --------------------------------------------------------------------------------
 Apache-2.0 — LICENSE
   exploit/, release/, docs/ (except docs/LKM-PORT.md), port/host/, port/device/,
-  port/tools/, NOTICE, README.md
+  port/tools/, port/README.md, NOTICE, README.md, README.zh-CN.md
 
 GPL-2.0 — see ksu/LICENSE
   ksu/ (KernelSU tree and the prebuilt binaries it ships)

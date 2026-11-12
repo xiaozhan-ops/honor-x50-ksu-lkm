@@ -24,7 +24,8 @@ device's own boot images** rather than copied from another model.
 
 Worth reading even if you never run it:
 
-* 91 kernel symbols resolved at runtime through naked asm trampolines. The
+* 91 kernel symbols resolved at runtime — 83 functions through naked asm
+  trampolines, 8 data symbols. The
   obvious C function-pointer macro compiles fine, passes every test you can run
   without hardware, and **hard-resets the device**: compiler-generated indirect
   calls carry CFI type hashes, and Honor's HISEC treats a mismatch as an attack.
@@ -163,6 +164,9 @@ retry and side-effect handling. Do not follow it for an X50.
   `kernelsu.ko` loads and the Manager reports it running. That exercises every
   offset end to end, but does not pin each one down individually — only
   `mm->owner` and `task->comm` are checked explicitly by the VERIFY stage.
+- **The Manager's "kernel update" banner.** With `KSU_VERSION` pinned the Manager
+  reports the module as working, yet still shows a banner asking to update the
+  kernel. Not chased down; the uapi version (2 here) is the likely mismatch.
 
 ## Documentation
 

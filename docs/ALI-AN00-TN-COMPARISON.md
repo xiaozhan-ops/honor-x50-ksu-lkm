@@ -118,8 +118,7 @@ NDK_ROOT=/path/to/android-ndk make PROJECT=annap-ALI-TN00_9.0.0.230 bin
 
 ## Build verified
 
-With NDK r29 (`android-ndk-r29`, from `E:/Projects/op13-cve-2026-64560/scratch/ndk`,
-read-only use), both profiles compile clean — zero errors:
+With NDK r29 (`android-ndk-r29`), both profiles compile clean — zero errors:
 
 ```
 build/annap-ALI-AN00_9.0.0.220/bin/exploit            65,104  4a02a10ce775
