@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# Patch files must survive checkout byte-for-byte, on any host.
+*.patch -text -eol
+*.sh    text eol=lf
+*.ps1   text eol=crlf

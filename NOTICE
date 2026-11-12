@@ -115,3 +115,26 @@ Third-party components redistributed in this repository
 ksu/tools/ksud, ksu/tools/magiskpolicy — prebuilt binaries from the KernelSU and
 Magisk projects. KernelSU is GPL-2.0 (see ksu/LICENSE); Magisk is GPL-2.0.
 They are redistributed unmodified.
+
+--------------------------------------------------------------------------------
+Licensing summary (this repository mixes two licences)
+--------------------------------------------------------------------------------
+Apache-2.0 — LICENSE
+  exploit/, release/, docs/ (except docs/LKM-PORT.md), port/host/, port/device/,
+  port/tools/, NOTICE, README.md
+
+GPL-2.0 — see ksu/LICENSE
+  ksu/ (KernelSU tree and the prebuilt binaries it ships)
+  port/kernelsu-3.3.0-honor-5.10.226.patch — a patch against GPL-2.0 code, and
+  therefore itself GPL-2.0. The port does not relicense KernelSU; it only
+  carries the local modifications, which are available under the same terms.
+  port/build.sh and port/fix-versions.py are build helpers for that GPL-2.0
+  module and are distributed under GPL-2.0 as well, to keep the module's whole
+  build reproducible under one licence.
+
+docs/LKM-PORT.md is a description of the port, not a derivative of its code, and
+is Apache-2.0 like the rest of the documentation.
+
+If you redistribute a built kernelsu.ko, GPL-2.0 requires you to make the
+corresponding source (KernelSU v3.3.0 plus this patch) available to whoever
+receives the binary.

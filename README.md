@@ -184,6 +184,12 @@ project's 80 GT profiles. That project was the source of the extraction workflow
 - The files under [`ksu/`](ksu/) are **GPL-2.0** (see [ksu/LICENSE](ksu/LICENSE)):
   `init-bootid.patch` and `ksu_rules.annotated` derive from KernelSU's `kernel/`
   directory, which is GPL-2.0.
+- [`port/kernelsu-3.3.0-honor-5.10.226.patch`](port/) patches that GPL-2.0 tree
+  and is therefore **GPL-2.0** too. `port/build.sh` and `port/fix-versions.py`
+  ship under the same terms so the module build stays under one licence. The
+  rest of `port/` (host and device tooling) is Apache-2.0.
+- Shipping a built `kernelsu.ko` obliges you to offer its source — KernelSU
+  v3.3.0 plus this patch — to whoever receives the binary.
 
 ## Warning
 
@@ -191,3 +197,17 @@ For security research on your own device. Running this modifies kernel memory
 through a UAF; a failed attempt reboots the phone. Root is full control of the
 device. Flashes, partition writes, and disabling protections after rooting are
 not covered by this tool and can permanently brick a device.
+
+Use the profile that matches your firmware. Several struct offsets in both X50
+profiles are inherited from another Honor model and are marked `UNVERIFIED` in
+the headers; a wrong value does not fail loudly, it either dies silently mid-chain
+or writes a cred pointer somewhere unintended. Confirm the build first:
+
+```bash
+adb shell getprop ro.build.display.id
+adb shell uname -a
+```
+
+Root here is temporary by construction: the cred swap and the kernel module both
+live in RAM, and a reboot undoes everything. There is no persistent install, and
+none is possible without an unlocked bootloader.
