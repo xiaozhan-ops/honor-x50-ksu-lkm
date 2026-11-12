@@ -1,6 +1,15 @@
 
 # Custom KernelSU.ko for Honor 80 GT
 
+> **Scope note.** This directory is the **Honor 80 GT (AGT-AN00)** loader that
+> this repository was forked from. It is kept for provenance: `load_ko.c` and
+> the bind-mounted fake kallsyms are the approach the X50 work started from, and
+> `kallsyms_names` is the symbol dump the X50 profiles were measured against.
+>
+> It does **not** work for the X50. The X50 uses the external-module port in
+> [`../port/`](../port/) — a real `kernelsu.ko` with a runtime symbol shim, no
+> fake kallsyms. See [`../docs/LKM-PORT.md`](../docs/LKM-PORT.md).
+
 The stock GKI `android12-5.10_kernelsu.ko` is built against GKI headers whose
 struct layouts don't match Honor's, so it cannot load. It must be
 rebuilt from Honor's own kernel source (the MagicOS opensource package) with

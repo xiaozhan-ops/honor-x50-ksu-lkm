@@ -66,13 +66,19 @@ CHANGED  exploit/Makefile
        every libc include fail. RESOURCE_DIR is globbed rather than pinned to
        lib/clang/21, which does not exist in NDK r29.
 
-CHANGED  README.md, ksu/README.md
-       Rewritten to cover only the Honor X50. The upstream per-device tables and
-       per-model build instructions were removed. Now English-only.
+CHANGED  README.md
+       Rewritten to cover the Honor X50; per-device tables for other models were
+       dropped from it.
 
-REMOVED  README.zh-CN.md, ksu/README.zh-CN.md
-       The repository is English-only; the English READMEs are the sole entry
-       points.
+NOT CHANGED  ksu/README.md
+       Still the Honor 80 GT loader documentation this fork was cloned from. A
+       scope note at the top now states that it does not work for the X50, which
+       uses port/ instead. An earlier draft of this NOTICE claimed this file had
+       been rewritten for the X50; that was wrong, and is corrected here.
+
+ADDED    README.zh-CN.md
+       Restored after the earlier English-only pass. README.md is the English
+       entry point and links to it; the rest of the repository stays English.
 
 CHANGED  release/setup.sh
        Three runtime prompts translated from Chinese to English.

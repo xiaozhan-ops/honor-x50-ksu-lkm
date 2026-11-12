@@ -77,20 +77,38 @@ Makefile 会自行探测 NDK host tag（`windows-x86_64`、`darwin-x86_64`、`li
 
 ## 运行
 
-一切都在设备上跑。推送 release 包并启动 exploit：
+root 是运行时产生的，顺序不能反：先提权，再加载模块。
 
-```bash
-cd release
-./setup.sh              # 探测当前内核，选匹配的 profile
+### X50
+
+X50 走 [`port/`](port/) 里的外部模块方案。Windows 上：
+
+```powershell
+powershell -File port/host/restore.ps1 -Payload E:\payload
 ```
 
-`setup.sh` 会把运行中的内核与内置 manifest 比对，跑整条链，失败自动重试。失败的尝试会重启
-手机，通常重跑一次就够。
+它会自己重启卡进 exploit 的时间窗、跑完整条链、加载 `kernelsu.ko`，失败自动重试。
+如果已经有 shell 身份（adb shell、Shizuku、Termux + adb），也可以在设备上直接跑：
 
-提权成功后会自动打开 KernelSU Manager。整条链在退出时会还原 `sig_enforce`、SELinux enforcing
-和被劫持的 `boot_id` ctl 表项 —— 而且无论如何，重启都会还原一切。
+```sh
+sh /data/local/tmp/restore_ondevice.sh
+```
 
-单次成功率不是 100%。竞态失败通常意味着 anchor 在它的 cred 写落地之前就死了；重跑即可。
+两者都要求 payload 目录（或 `/data/local/tmp`）里有 `gl_root`、`ksu_ctrl.ko`、`ksud`、
+`ksu_loader.sh`。整条链必须在开机后约一分钟内启动——这正是 `restore.ps1` 自己负责重启的原因。
+
+之后：
+
+```bash
+adb shell /data/local/tmp/kbin/su -c id
+```
+
+### 荣耀 80 GT（继承来的，不适用于 X50）
+
+`release/` 是 fork 自带、面向 80 GT 的打包脚本。`release/setup.sh` 会把运行中的内核与
+`release/manifest` 比对后跑链，但那个 manifest 由 `release/make-release.sh` 生成，而它目前
+只输出 `annap-AGT-AN00_*`（80 GT）条目 —— 所以它**打不出可用的 X50 包**。保留它的原因是
+留存来源，以及 X50 的脚本沿用了它的重试与副作用处理逻辑。X50 不要照着它做。
 
 ## 哪些验证过，哪些没有
 
