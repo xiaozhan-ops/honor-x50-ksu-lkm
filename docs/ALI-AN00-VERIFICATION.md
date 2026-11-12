@@ -8,6 +8,11 @@ established, and what remains unproven.
 > two-boot comparison and the per-version `SLIDE_RT_SCHED_CLASS_OFF` difference,
 > see **docs/ALI-AN00-TN-COMPARISON.md**.
 
+
+> The 80 GT target profiles this analysis compares against are no longer
+> shipped in this repository (see NOTICE). Their numbers are kept here as the
+> measurement record the X50 offsets were derived from.
+
 ## Summary
 
 All 9 kernel symbols the exploit depends on were read directly out of this

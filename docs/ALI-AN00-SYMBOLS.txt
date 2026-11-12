@@ -22,6 +22,11 @@ Tool: `kallsyms.c` (from IonStack's `target_generator`, GPL), `gcc -O2`.
 The full tables are ~6.1 MB each and are not committed; only the symbols the
 exploit depends on are listed below. `cmp_boots.py` regenerates the comparison.
 
+
+> The 80 GT target profiles this analysis compares against are no longer
+> shipped in this repository (see NOTICE). Their numbers are kept here as the
+> measurement record the X50 offsets were derived from.
+
 ## Identical on both boots
 
 ```

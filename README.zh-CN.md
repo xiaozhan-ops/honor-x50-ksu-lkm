@@ -17,17 +17,12 @@
 
 ## 仓库结构
 
-这是一个项目，里面有两层历史。分开是刻意的：80 GT 那部分是 fork 的来源，保留它是为了
-让 X50 的偏移仍然可复现——而不是因为它能在 X50 上跑。
-
 | 路径 | 是什么 |
 | :--- | :--- |
-| [`port/`](port/) | **X50 的 KernelSU LKM 移植**：补丁、构建脚本、主机侧与设备侧工具、allowlist 生成器 |
+| [`port/`](port/) | **KernelSU LKM 移植**：补丁、构建脚本、主机侧与设备侧工具、allowlist 生成器 |
 | [`docs/LKM-PORT.md`](docs/LKM-PORT.md) | 移植怎么工作，以及最费时的那两个坑 |
-| [`exploit/`](exploit/) | CVE-2026-43499 的利用链与各机型 target profile |
-| [`docs/`](docs/) | 偏移来源、两次 boot 的符号对比、验证工具 |
-| [`ksu/`](ksu/) | **历史遗留** —— fork 来源的 80 GT loader。X50 不用它 |
-| [`release/`](release/) | **历史遗留** —— 80 GT 的打包脚本。打不出 X50 的包 |
+| [`exploit/`](exploit/) | CVE-2026-43499 的利用链与两个 X50 target profile |
+| [`docs/`](docs/) | 偏移来源、AN/TN 对比、验证记录 |
 
 ## 移植难在哪
 
@@ -51,10 +46,6 @@ root 依然是**一次性的（每次开机重来）**：cred 替换和内核模
 | :--- | :--- | :--- | :--- |
 | `annap-ALI-AN00_9.0.0.220` | 荣耀 X50（ALI-AN00） | MagicOS 9.0.0.220，build CNC00E206R9P4 | `5.10.236-android12-9-gf68ed03ce0d2` |
 | `annap-ALI-TN00_9.0.0.230` | 荣耀 X50（ALI-TN00） | MagicOS 9.0.0.230 | `5.10.236-android12-9-g4b262e5255ed` |
-
-`exploit/src/targets/` 里还带着 fork 随附的 `annap-AGT-AN00_*`（荣耀 80 GT）profile。
-那些在本项目里不维护，本项目也不对其作任何声明；`ksu/` 与 `release/` 同样是 80 GT 的工具，
-只为留存来源而保留（见各自的说明）。
 
 偏移是用 `kallsyms.c` 从各自 boot dump 里切出来的 kernel Image 上提取的（各 140,046 个符号）。
 
@@ -121,13 +112,6 @@ sh /data/local/tmp/restore_ondevice.sh
 adb shell /data/local/tmp/kbin/su -c id
 ```
 
-### 荣耀 80 GT（继承来的，不适用于 X50）
-
-`release/` 是 fork 自带、面向 80 GT 的打包脚本。`release/setup.sh` 会把运行中的内核与
-`release/manifest` 比对后跑链，但那个 manifest 由 `release/make-release.sh` 生成，而它目前
-只输出 `annap-AGT-AN00_*`（80 GT）条目 —— 所以它**打不出可用的 X50 包**。保留它的原因是
-留存来源，以及 X50 的脚本沿用了它的重试与副作用处理逻辑。X50 不要照着它做。
-
 ## 哪些验证过，哪些没有
 
 **在本机实测**（见 [docs/](docs/)）：
@@ -165,8 +149,7 @@ adb shell /data/local/tmp/kbin/su -c id
 - **[docs/ALI-AN00-VERIFICATION.md](docs/ALI-AN00-VERIFICATION.md)** —— 提取流程与每个偏移的来源
 - **[docs/ALI-AN00-SYMBOLS.txt](docs/ALI-AN00-SYMBOLS.txt)** —— 两次 boot 的实测符号表，加相关
   kernel config
-- **[docs/cmp_boots.py](docs/cmp_boots.py)**、**[docs/verify_offsets.py](docs/verify_offsets.py)**
-  —— 可复现的对比工具
+- **[docs/cmp_boots.py](docs/cmp_boots.py)** —— 可复现的两次 boot 对比
 
 ## 为什么要自备 .ko 和 loader
 
@@ -178,12 +161,12 @@ exploit 在加载前把它翻成 0，loader 脚本在模块进内核后再还原
 （链接地址 + KASLR slide）补在最前面。
 
 GKI 的结构体布局也与荣耀的不同，所以原版 GKI 的 `android12-5.10_kernelsu.ko` 不能用。
-`ksu/` 会针对与固件 sublevel 匹配的 MagicOS 内核源码、以及本机内核 config 重新构建 KernelSU。
-见 [ksu/README.md](ksu/README.md)。
+[`port/`](port/) 会针对与固件 sublevel 匹配的 MagicOS 内核源码、以及本机内核 config 重新构建
+KernelSU v3.3.0。
 
 ## 致谢
 
-X50 的 target profile、exploit 适配以及最初的 `ksu/` loader 来自 **a23bc** 的 ALI-AN00
+X50 的 target profile 与 exploit 适配来自 **a23bc** 的 ALI-AN00
 移植，本次工作是在其基础上克隆展开的。[`port/`](port/) 下的 LKM 移植及其文档由本次
 工作新增。
 
@@ -209,8 +192,7 @@ X50 profile 里的结构体布局偏移沿用自参考项目的 80 GT profile。
 
 - 仓库中的 exploit 与工具（`exploit/`、顶层 `docs/`）为 **Apache License 2.0**
   （见 [LICENSE](LICENSE)），与本移植所源自的上游项目一致。
-- [`ksu/`](ksu/) 下的文件为 **GPL-2.0**（见 [ksu/LICENSE](ksu/LICENSE)）：`init-bootid.patch`
-  与 `ksu_rules.annotated` 派生自 KernelSU 的 `kernel/` 目录，后者是 GPL-2.0。
+- 补丁与构建脚本为 **GPL-2.0**：许可证全文见 [`port/LICENSE-GPL-2.0`](port/LICENSE-GPL-2.0)。
 - [`port/kernelsu-3.3.0-honor-5.10.226.patch`](port/) 是对该 GPL-2.0 代码树的补丁，因此
   同样是 **GPL-2.0**。`port/build.sh` 与 `port/fix-versions.py` 以相同条款发布，使模块构建
   处于同一许可之下。`port/` 其余部分（主机侧与设备侧工具）为 Apache-2.0。

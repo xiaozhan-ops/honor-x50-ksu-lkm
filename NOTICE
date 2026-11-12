@@ -70,7 +70,7 @@ CHANGED  README.md
        Rewritten to cover the Honor X50; per-device tables for other models were
        dropped from it.
 
-NOT CHANGED  ksu/README.md
+NOT CHANGED  ksu/README.md   (removed later in this branch, see REMOVED)
        Still the Honor 80 GT loader documentation this fork was cloned from. A
        scope note at the top now states that it does not work for the X50, which
        uses port/ instead. An earlier draft of this NOTICE claimed this file had
@@ -80,10 +80,11 @@ ADDED    README.zh-CN.md
        Restored after the earlier English-only pass. README.md is the English
        entry point and links to it; the rest of the repository stays English.
 
-CHANGED  release/setup.sh
+CHANGED  release/setup.sh   (removed later in this branch, see REMOVED)
        Three runtime prompts translated from Chinese to English.
 
 CHANGED  docs/cmp_boots.py, docs/verify_offsets.py, ksu/build_inner.sh
+       (verify_offsets.py and ksu/build_inner.sh were removed later in this branch)
        Comments and output rewritten in English; no functional change to the
        scripts.
 
@@ -121,6 +122,20 @@ ADDED    docs/LKM-PORT.md                 why the port looks the way it does:
                                           ni-syscall thunks, the tracepoint copy
                                           trap, deferred throne scan, allowlist
 
+REMOVED (this branch)   all Honor 80 GT material
+       ksu/ — the 80 GT-era loader (load_ko.c, ksu_load_ko.sh, ksu_ko_build.sh,
+       kernel.config, kallsyms_names) and the prebuilt ksud / magiskpolicy it
+       shipped. It is what this fork was cloned from, and it does not run on the
+       X50.
+       release/ — the 80 GT release bundler. It only ever emitted AGT entries.
+       exploit/src/targets/annap-AGT-AN00_* — 18 target profiles for the 80 GT.
+       docs/verify_offsets.py — verified offsets against the AGT reference
+       profile, which no longer ships here.
+       The GPL-2.0 text that lived in ksu/LICENSE is kept as
+       port/LICENSE-GPL-2.0, because port/ contains GPL-2.0 material.
+       Attribution to the upstream projects is retained below, as Apache-2.0
+       section 4 requires; only the code and tooling were removed.
+
 --------------------------------------------------------------------------------
 CVE-2026-43499 ("GhostLock")
 --------------------------------------------------------------------------------
@@ -132,20 +147,20 @@ Reported by VEGA at Nebula Security.
 --------------------------------------------------------------------------------
 Third-party components redistributed in this repository
 --------------------------------------------------------------------------------
-ksu/tools/ksud, ksu/tools/magiskpolicy — prebuilt binaries from the KernelSU and
-Magisk projects. KernelSU is GPL-2.0 (see ksu/LICENSE); Magisk is GPL-3.0 (see
-ksu/tools/README.md). They are redistributed unmodified. Checksums are listed in
-ksu/tools/README.md so a recipient can verify what they got.
+Nothing is redistributed prebuilt in the repository tree any more: the 80 GT
+bundle that carried ksud and magiskpolicy was removed (see above). The built
+kernelsu.ko is published as a GitHub Release rather than committed, and its
+source is this repository's patch plus KernelSU v3.3.0. ksud is obtained from the
+KernelSU manager release APK, which the reader installs themselves.
 
 --------------------------------------------------------------------------------
 Licensing summary (this repository mixes two licences)
 --------------------------------------------------------------------------------
 Apache-2.0 — LICENSE
-  exploit/, release/, docs/ (except docs/LKM-PORT.md), port/host/, port/device/,
+  exploit/, docs/ (except docs/LKM-PORT.md), port/host/, port/device/,
   port/tools/, port/README.md, NOTICE, README.md, README.zh-CN.md
 
-GPL-2.0 — see ksu/LICENSE
-  ksu/ (KernelSU tree and the prebuilt binaries it ships)
+GPL-2.0 — see port/LICENSE-GPL-2.0
   port/kernelsu-3.3.0-honor-5.10.226.patch — a patch against GPL-2.0 code, and
   therefore itself GPL-2.0. The port does not relicense KernelSU; it only
   carries the local modifications, which are available under the same terms.

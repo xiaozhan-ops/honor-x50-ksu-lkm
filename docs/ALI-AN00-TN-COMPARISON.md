@@ -27,6 +27,11 @@ What does affect this port is narrower and directly measured: the `sched_class`
 symbol group sits `0x200` apart between the two. That is a fact about addresses,
 not about hashes, and it is what forces separate target profiles.
 
+
+> The 80 GT target profiles this analysis compares against are no longer
+> shipped in this repository (see NOTICE). Their numbers are kept here as the
+> measurement record the X50 offsets were derived from.
+
 ## Symbol comparison
 
 `docs/cmp_boots.py` reports: **11 same / 5 differ / 0 skipped, of 16**.
