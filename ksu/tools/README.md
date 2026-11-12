@@ -37,3 +37,19 @@ The on-device package carries a set of helper binaries. Provenance per file:
   On any abort the exploit-side boot_id hijack is never restored (the .ko's
   bootid_ctl/bootid_buf params do that on success), so an aborted run requires a
   reboot — the script says so in its log.
+## Integrity
+
+These are the shipped bytes; the upstream releases they came from are not pinned
+to a specific build, so a mismatch here means the file was replaced rather than
+rebuilt. Verify after cloning:
+
+| file | size | sha256 |
+|---|---|---|
+| `ksud` | 4,892,712 | `99aaa607e9c9da6a0e898366ecf0a14dd67224ea726d952d1ce575e62d3b5c41` |
+| `magiskpolicy` | 356,584 | `9837db9db475eb74b6715f081768cb6a1f2fb5a2b2ac15755686062501bace27` |
+| `kallsyms_names` | 3,679,374 | `a442099476568cc4e50157aa1048eeeb85a86b1e9e53a5502d8acc08219657fc` |
+
+`kallsyms_names` is the symbol dump the X50 profiles were measured against
+(140,046 symbols, extracted from the kernel Image inside the device's own boot
+dump). It is data, not code: it is what makes the offsets in
+`exploit/src/targets/` reproducible without needing the device.

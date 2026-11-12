@@ -1,22 +1,26 @@
 
-# Honor X50 Privilege Escalation: GhostLock (CVE-2026-43499)
+# Honor X50 (ALI-AN00): KernelSU LKM port on a locked bootloader
 
-A local privilege escalation exploit for the **Honor X50 (ALI-AN00 / ALI-TN00)**,
-CVE-2026-43499 — a use-after-free in the kernel `rtmutex` `remove_waiter` path —
-plus a companion KernelSU kernel-module loading solution.
+A working **KernelSU kernel-module (LKM) port** for the Honor X50
+(ALI-AN00 / ALI-TN00), together with the privilege escalation required to load
+it on a device whose bootloader cannot be unlocked.
+
+The port is the substance. [`port/`](port/) turns a one-shot uid 0 into `su` for
+authorised apps, a Manager that actually talks to the kernel, and per-app
+authorisation — on a vendor kernel (5.10.236) that has no matching source release
+and does not export much of what KernelSU calls. Engineering write-up:
+[docs/LKM-PORT.md](docs/LKM-PORT.md).
+
+The escalation is the enabling step: CVE-2026-43499, a use-after-free in the
+kernel `rtmutex` `remove_waiter` path, used to obtain a controlled 8-byte write
+and then swap `cred` for `init_cred`.
 
 Kernel-address offsets in both target profiles were measured from **this
 device's own boot images** rather than copied from another model.
 
-## KernelSU port
+## What makes the port hard
 
-The escalation above is the enabling half. The other half is a KernelSU LKM port
-that turns a one-shot uid 0 into something usable: `su` from any authorised app,
-a Manager that talks to the kernel, and per-app authorisation.
-
-It lives in [`port/`](port/) with the engineering write-up in
-[docs/LKM-PORT.md](docs/LKM-PORT.md). The parts worth reading even if you never
-run it:
+Worth reading even if you never run it:
 
 * 91 kernel symbols resolved at runtime through naked asm trampolines. The
   obvious C function-pointer macro compiles fine, passes every test you can run
@@ -175,6 +179,10 @@ which in turn derives from:
 Struct-layout offsets in the X50 profiles are carried over from the reference
 project's 80 GT profiles. That project was the source of the extraction workflow
 (`kallsyms.c`) reused here. Full provenance is in [NOTICE](NOTICE).
+
+## Attribution
+
+Built with assistance from **DeepSeek-V4.1-Flash** — 此项目由 DeepSeek-V4.1-Flash 提供。
 
 ## License
 

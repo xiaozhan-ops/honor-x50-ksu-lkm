@@ -1,4 +1,4 @@
-ALI-AN00-cve-2026-43499
+Honor X50 (ALI-AN00) KernelSU LKM port
 Copyright 2026 a23bc and contributors
 
 This repository is a fork of yakidango-official/GhostLock-H80GT. The exploit
@@ -113,8 +113,9 @@ Reported by VEGA at Nebula Security.
 Third-party components redistributed in this repository
 --------------------------------------------------------------------------------
 ksu/tools/ksud, ksu/tools/magiskpolicy — prebuilt binaries from the KernelSU and
-Magisk projects. KernelSU is GPL-2.0 (see ksu/LICENSE); Magisk is GPL-2.0.
-They are redistributed unmodified.
+Magisk projects. KernelSU is GPL-2.0 (see ksu/LICENSE); Magisk is GPL-3.0 (see
+ksu/tools/README.md). They are redistributed unmodified. Checksums are listed in
+ksu/tools/README.md so a recipient can verify what they got.
 
 --------------------------------------------------------------------------------
 Licensing summary (this repository mixes two licences)
