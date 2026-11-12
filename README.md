@@ -20,6 +20,21 @@ and then swap `cred` for `init_cred`.
 Kernel-address offsets in both target profiles were measured from **this
 device's own boot images** rather than copied from another model.
 
+## Repository layout
+
+One project, with two historical layers. The split is deliberate: the 80 GT
+material is what this fork was cloned from, and it is kept so the X50 offsets
+stay reproducible — not because it runs on an X50.
+
+| Path | What it is |
+| :--- | :--- |
+| [`port/`](port/) | **The X50 KernelSU LKM port.** Patch, build script, host and device tooling, allowlist generator |
+| [`docs/LKM-PORT.md`](docs/LKM-PORT.md) | How that port works, and the two mistakes that cost the most time |
+| [`exploit/`](exploit/) | The CVE-2026-43499 chain and the per-device target profiles |
+| [`docs/`](docs/) | Offset provenance, the two-boot symbol comparison, verification tooling |
+| [`ksu/`](ksu/) | **Legacy** — the 80 GT-era loader this repo was forked from. Not used on the X50 |
+| [`release/`](release/) | **Legacy** — the 80 GT bundler. Produces no X50 bundle |
+
 ## What makes the port hard
 
 Worth reading even if you never run it:

@@ -1,5 +1,5 @@
 
-# Custom KernelSU.ko for Honor 80 GT
+# Legacy KernelSU loader (Honor 80 GT) — not used on the X50
 
 > **Scope note.** This directory is the **Honor 80 GT (AGT-AN00)** loader that
 > this repository was forked from. It is kept for provenance: `load_ko.c` and
