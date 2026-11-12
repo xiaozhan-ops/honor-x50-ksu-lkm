@@ -170,7 +170,11 @@ config. See [`ksu/README.md`](ksu/README.md).
 
 ## Credits
 
-This X50 port builds on the exploit and target framework from
+The X50 target profiles, the exploit adaptation and the original `ksu/` loader
+come from **a23bc**'s ALI-AN00 port, which this work was cloned from. The LKM
+port under [`port/`](port/) and its documentation are added here.
+
+That port builds on the exploit and target framework from
 [yakidango-official/GhostLock-H80GT](https://github.com/yakidango-official/GhostLock-H80GT),
 which in turn derives from:
 

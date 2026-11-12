@@ -144,7 +144,11 @@ GKI 的结构体布局也与荣耀的不同，所以原版 GKI 的 `android12-5.
 
 ## 致谢
 
-本 X50 移植建立在 [yakidango-official/GhostLock-H80GT](https://github.com/yakidango-official/GhostLock-H80GT)
+X50 的 target profile、exploit 适配以及最初的 `ksu/` loader 来自 **a23bc** 的 ALI-AN00
+移植，本次工作是在其基础上克隆展开的。[`port/`](port/) 下的 LKM 移植及其文档由本次
+工作新增。
+
+该移植建立在 [yakidango-official/GhostLock-H80GT](https://github.com/yakidango-official/GhostLock-H80GT)
 的 exploit 与 target 框架之上，后者又源自：
 
 - [NebuSec/CyberMeowfia — IonStack / CVE-2026-43499](https://github.com/NebuSec/CyberMeowfia)

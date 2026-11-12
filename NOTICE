@@ -1,10 +1,24 @@
 Honor X50 (ALI-AN00) KernelSU LKM port
 Copyright 2026 a23bc and contributors
+Copyright 2026 xiaozhan-ops for the KernelSU LKM port (port/, docs/LKM-PORT.md)
+and the README rewrite
 
 This repository is a fork of yakidango-official/GhostLock-H80GT. The exploit
-core is unmodified from that project; what this fork adds is target profiles
+core is unmodified from that project; what a23bc's fork adds is target profiles
 measured from the Honor X50's own boot images, plus the verification tooling and
 documentation behind them.
+
+There are two stages of authorship here, and they should not be conflated:
+
+  1. a23bc's ALI-AN00 port - the X50 target profiles, the exploit adaptation,
+     the ksu/ loader (load_ko.c and the bind-mounted kallsyms approach), and
+     docs/ALI-AN00-*.md. This is what the present work was cloned from.
+
+  2. This fork - the KernelSU LKM port under port/ (patch, build, device and
+     host tooling, allowlist generator), docs/LKM-PORT.md, the README
+     restructure and README.zh-CN.md. A different approach to the same goal: an
+     external kernelsu.ko with a runtime symbol shim, instead of ksu/'s
+     fake-kallsyms loader.
 
 Upstream chain of custody
 --------------------------------------------------------------------------------
